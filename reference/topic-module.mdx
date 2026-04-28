@@ -1,0 +1,302 @@
+---
+title: "Topic module reference: all inputs and outputs"
+description: "Complete reference for the FSI Kafka Platform topic Terraform module — every input variable, output, and configuration default explained."
+---
+
+The `modules/topic` Terraform module is the single entry point for provisioning a fully governed Kafka topic on the FSI Data Streaming Platform. One module call produces a topic on the production cluster, a registered Avro schema with compatibility enforcement, RBAC bindings for producers and consumers, governance metadata tags on the Schema Registry subject, and — unless explicitly disabled — a mirror topic on the DR cluster. All configuration defaults are derived automatically from `sla_tier`, so teams rarely need to set overrides.
+
+## Example module call
+
+The following example, drawn from the self-service onboarding guide and the module header comments, shows a complete critical-tier topic for the core banking domain.
+
+```hcl
+module "cncb_account_txn" {
+  source         = "../../modules/topic"
+  domain         = "cncb"
+  application    = "core"
+  schema_version = "v1"
+  entity         = "account-transaction"
+
+  owner               = "cncb-team@fsi.org"
+  sla_tier            = "critical"
+  data_classification = "internal"
+
+  schema_file = "../../schemas/cncb-account-transaction.avsc"
+  pii_fields  = ["member_name", "ssn_last4", "account_number"]
+
+  producer_service_accounts = ["sa-cncb-producer"]
+  consumer_service_accounts = ["sa-cncb-consumer", "sa-rtfd-enrichment"]
+
+  # Infrastructure references — copy from environment-level variables
+  kafka_cluster_id              = var.kafka_cluster_id
+  kafka_rest_endpoint           = var.kafka_rest_endpoint
+  kafka_api_key                 = var.kafka_api_key
+  kafka_api_secret              = var.kafka_api_secret
+  kafka_cluster_crn             = var.kafka_cluster_crn
+  schema_registry_cluster_id   = var.schema_registry_cluster_id
+  schema_registry_rest_endpoint = var.schema_registry_rest_endpoint
+  schema_registry_api_key       = var.schema_registry_api_key
+  schema_registry_api_secret    = var.schema_registry_api_secret
+  schema_registry_cluster_crn  = var.schema_registry_cluster_crn
+  dr_kafka_cluster_id           = var.dr_kafka_cluster_id
+  dr_kafka_rest_endpoint        = var.dr_kafka_rest_endpoint
+  dr_kafka_api_key              = var.dr_kafka_api_key
+  dr_kafka_api_secret           = var.dr_kafka_api_secret
+}
+```
+
+The topic name is assembled by the module as `{domain}.{application}.{schema_version}.{entity}` — for the example above, `cncb.core.v1.account-transaction`.
+
+## Input variables
+
+### Topic identity
+
+These four variables are required and together assemble the canonical topic name. All four are validated against `^[a-z][a-z0-9-]{1,30}$` (or `{1,60}` for entity) at plan time.
+
+<ParamField path="domain" type="string" required>
+  Business domain owning the topic (e.g. `cncb`, `rtfd`, `ofac`, `eventgrid`). Lowercase alphanumeric with hyphens, 2–31 characters, starting with a letter.
+</ParamField>
+
+<ParamField path="application" type="string" required>
+  Application name within the domain (e.g. `core`, `alerts`, `screening`). Lowercase alphanumeric with hyphens, 2–31 characters.
+</ParamField>
+
+<ParamField path="schema_version" type="string" required>
+  Schema version identifier. Must follow the pattern `v1`, `v2`, etc.
+</ParamField>
+
+<ParamField path="entity" type="string" required>
+  The data entity this topic carries (e.g. `account-transaction`, `fraud-signal`). Lowercase alphanumeric with hyphens, 2–61 characters.
+</ParamField>
+
+### Governance metadata
+
+<ParamField path="owner" type="string" required>
+  Team email address responsible for this topic (e.g. `cncb-team@fsi.org`). Validated as a syntactically correct email address. Stamped onto the Schema Registry subject as a metadata property for data lineage tools.
+</ParamField>
+
+<ParamField path="sla_tier" type="string" required>
+  SLA tier that drives automatic derivation of compatibility mode, partition count, retention period, and DR priority. Must be one of: `critical`, `standard`, `best-effort`, `compliance`.
+
+  | Tier | Compatibility | Partitions | Retention |
+  |---|---|---|---|
+  | `critical` | `FULL_TRANSITIVE` | 12 | 7 days |
+  | `standard` | `BACKWARD_TRANSITIVE` | 6 | 3 days |
+  | `best-effort` | `BACKWARD` | 3 | 1 day |
+  | `compliance` | `FULL_TRANSITIVE` | 12 | Configurable via `retention_years` |
+</ParamField>
+
+<ParamField path="data_classification" type="string" default="internal">
+  Data classification per FSI policy. Must be one of: `confidential`, `internal`, `public`. Setting `confidential` activates CSFLE encryption and requires `kek_name`, `csfle_kms_type`, `csfle_kms_key_id`, and at least one entry in `pii_fields`.
+</ParamField>
+
+### Schema
+
+<ParamField path="schema_file" type="string" required>
+  Path to the Avro schema file (`.avsc`) relative to the calling module directory. The file contents are read at plan time using `file()`. Place schemas in `/schemas/{domain}-{entity}.avsc` following the naming conventions in the [schema guide](/governance/schema-guide).
+</ParamField>
+
+<ParamField path="pii_fields" type="list(string)" default="[]">
+  List of Avro field names in the schema that contain personally identifiable information. Used for governance metadata tagging and, when `data_classification = confidential`, to drive CSFLE encryption rules. A `confidential` topic with an empty `pii_fields` list will fail at plan time.
+</ParamField>
+
+### Access control
+
+<ParamField path="create_service_accounts" type="bool" default="false">
+  When `true`, the module creates new Confluent Cloud service accounts using the names in `producer_sa_names` and `consumer_sa_names`. When `false` (the default), existing service account IDs must be supplied via `producer_service_accounts` and `consumer_service_accounts`.
+</ParamField>
+
+<ParamField path="producer_sa_names" type="list(string)" default="[]">
+  Display names for producer service accounts to create. Only used when `create_service_accounts = true`.
+</ParamField>
+
+<ParamField path="consumer_sa_names" type="list(string)" default="[]">
+  Display names for consumer service accounts to create. Only used when `create_service_accounts = true`.
+</ParamField>
+
+<ParamField path="producer_service_accounts" type="list(string)" default="[]">
+  Confluent Cloud service account IDs to grant `DeveloperWrite` on the topic and `DeveloperWrite` on the Schema Registry subject. Used when `create_service_accounts = false`. At least one producer is required — the module will fail at plan time without one.
+</ParamField>
+
+<ParamField path="consumer_service_accounts" type="list(string)" default="[]">
+  Confluent Cloud service account IDs to grant `DeveloperRead` on the topic, `DeveloperRead` on consumer group prefixes, and `DeveloperRead` on the Schema Registry subject.
+</ParamField>
+
+### Overrides
+
+These variables override the defaults derived from `sla_tier`. All three default to `null`, which instructs the module to use the C4E-governed value for the given tier.
+
+<ParamField path="compatibility_override" type="string" default="null">
+  Override the auto-derived Schema Registry compatibility mode. Must be one of: `BACKWARD`, `BACKWARD_TRANSITIVE`, `FORWARD`, `FORWARD_TRANSITIVE`, `FULL`, `FULL_TRANSITIVE`, `NONE`. Leave `null` to use the C4E default for the tier.
+</ParamField>
+
+<ParamField path="partitions_override" type="number" default="null">
+  Override the auto-derived partition count. Leave `null` to use the C4E default for the tier. Note: Confluent Cloud does not support reducing partition counts after topic creation.
+</ParamField>
+
+<ParamField path="retention_ms_override" type="number" default="null">
+  Override the auto-derived retention in milliseconds. Leave `null` to use the C4E default for the tier.
+</ParamField>
+
+<ParamField path="cleanup_policy" type="string" default="delete">
+  Topic cleanup policy. Must be one of: `delete`, `compact`, `compact,delete`.
+</ParamField>
+
+### DR configuration
+
+<ParamField path="enable_dr_mirror" type="bool" default="true">
+  Whether to create a mirror topic on the DR (West) cluster via the bidirectional cluster link. Set to `false` only for topics that are explicitly excluded from DR — this requires documented approval from the C4E.
+</ParamField>
+
+<ParamField path="cluster_link_name" type="string" default="cluster_link_bidir_east_west">
+  Name of the bidirectional cluster link used for DR mirroring. This is an environment-level constant and is typically set in shared `group_vars` rather than per-topic.
+</ParamField>
+
+### Infrastructure references
+
+These variables are set once at the environment level (e.g. in `environments/prod-east/variables.tf`) and passed through to every module call. They are never set per-topic.
+
+<ParamField path="kafka_cluster_id" type="string" required>
+  Confluent Cloud Kafka cluster ID for the production (East) cluster.
+</ParamField>
+
+<ParamField path="kafka_rest_endpoint" type="string" required>
+  Kafka REST endpoint for the production cluster.
+</ParamField>
+
+<ParamField path="kafka_api_key" type="string" required>
+  API key for Kafka cluster operations. Marked sensitive — never output to logs.
+</ParamField>
+
+<ParamField path="kafka_api_secret" type="string" required>
+  API secret for Kafka cluster operations. Marked sensitive.
+</ParamField>
+
+<ParamField path="kafka_cluster_crn" type="string" required>
+  Confluent Resource Name (CRN) for the Kafka cluster, used to scope RBAC role bindings.
+</ParamField>
+
+<ParamField path="schema_registry_cluster_id" type="string" required>
+  Confluent Cloud Schema Registry cluster ID.
+</ParamField>
+
+<ParamField path="schema_registry_rest_endpoint" type="string" required>
+  Schema Registry REST endpoint.
+</ParamField>
+
+<ParamField path="schema_registry_api_key" type="string" required>
+  API key for Schema Registry operations. Marked sensitive.
+</ParamField>
+
+<ParamField path="schema_registry_api_secret" type="string" required>
+  API secret for Schema Registry operations. Marked sensitive.
+</ParamField>
+
+<ParamField path="schema_registry_cluster_crn" type="string" required>
+  CRN for the Schema Registry cluster, used to scope RBAC role bindings on subjects.
+</ParamField>
+
+<ParamField path="dr_kafka_cluster_id" type="string" default='""'>
+  Confluent Cloud Kafka cluster ID for the DR (West) cluster. Required when `enable_dr_mirror = true`.
+</ParamField>
+
+<ParamField path="dr_kafka_rest_endpoint" type="string" default='""'>
+  Kafka REST endpoint for the DR cluster.
+</ParamField>
+
+<ParamField path="dr_kafka_api_key" type="string" default='""'>
+  API key for DR Kafka cluster operations. Marked sensitive.
+</ParamField>
+
+<ParamField path="dr_kafka_api_secret" type="string" default='""'>
+  API secret for DR Kafka cluster operations. Marked sensitive.
+</ParamField>
+
+### Compliance
+
+<ParamField path="retention_years" type="number" default="-1">
+  Retention period in years for `compliance` tier topics, per FSI regulatory requirement D-11. `-1` means infinite retention. Any positive value must be `>= 7`. The module converts this to milliseconds internally (`1 year = 31,557,600,000 ms`). Only applies when `sla_tier = compliance`.
+</ParamField>
+
+### CSFLE encryption (confidential topics)
+
+These variables are only required when `data_classification = confidential`. They require the Stream Governance Advanced package on Confluent Cloud, per FSI policy D-08.
+
+<ParamField path="kek_name" type="string" default='""'>
+  Key Encryption Key name registered in the Schema Registry DEK Registry. Required for `confidential` topics.
+</ParamField>
+
+<ParamField path="csfle_kms_type" type="string" default='""'>
+  KMS provider type for CSFLE. Must be one of: `aws-kms`, `azure-kms`, `gcp-kms`, `hcvault`.
+</ParamField>
+
+<ParamField path="csfle_kms_key_id" type="string" default='""'>
+  KMS key identifier: ARN for AWS, Key Vault URI for Azure, resource name for GCP, path for Vault. Marked sensitive.
+</ParamField>
+
+<ParamField path="csfle_shared_kek" type="bool" default="true">
+  When `true`, the DEK Registry can call KMS directly. Required for Kafka Connect and ksqlDB to process encrypted data.
+</ParamField>
+
+## Outputs
+
+<ResponseField name="topic_name" type="string">
+  The fully qualified topic name assembled as `{domain}.{application}.{schema_version}.{entity}`.
+</ResponseField>
+
+<ResponseField name="topic_id" type="string">
+  Confluent Cloud internal resource ID for the Kafka topic.
+</ResponseField>
+
+<ResponseField name="value_subject" type="string">
+  Schema Registry subject name for the value schema, following TopicNameStrategy: `{topic_name}-value`.
+</ResponseField>
+
+<ResponseField name="schema_id" type="string">
+  Schema Registry schema identifier for the registered Avro schema version.
+</ResponseField>
+
+<ResponseField name="compatibility_mode" type="string">
+  The effective compatibility mode applied to the schema subject — either the SLA-tier default or the value of `compatibility_override`.
+</ResponseField>
+
+<ResponseField name="partitions" type="number">
+  Effective partition count — either the SLA-tier default or `partitions_override`.
+</ResponseField>
+
+<ResponseField name="retention_ms" type="number">
+  Effective retention period in milliseconds.
+</ResponseField>
+
+<ResponseField name="dr_mirror_topic_id" type="string">
+  Resource ID of the DR mirror topic. Empty string when `enable_dr_mirror = false`.
+</ResponseField>
+
+<ResponseField name="metadata" type="map(string)">
+  Schema metadata tags stamped onto the Schema Registry subject: `owner`, `sla-tier`, `data-classification`, `domain`, `application`, `pii`, and `pii-fields`.
+</ResponseField>
+
+<ResponseField name="producer_sa_ids" type="list(string)">
+  IDs of the effective producer service accounts — either created by the module or passed in via `producer_service_accounts`.
+</ResponseField>
+
+<ResponseField name="consumer_sa_ids" type="list(string)">
+  IDs of the effective consumer service accounts — either created by the module or passed in via `consumer_service_accounts`.
+</ResponseField>
+
+## Callouts
+
+<Tip>
+  **SLA tier auto-derivation.** You almost never need to set `compatibility_override`, `partitions_override`, or `retention_ms_override`. The C4E-governed defaults — derived from `sla_tier` — are calibrated for FSI workloads. Critical and compliance topics get `FULL_TRANSITIVE` compatibility and 12 partitions; standard gets `BACKWARD_TRANSITIVE` and 6 partitions; best-effort gets `BACKWARD` and 3 partitions. Override only when you have a documented architectural reason, and expect C4E review.
+</Tip>
+
+<Warning>
+  **`compatibility_override` requires documented justification.** Overriding compatibility on a production topic — especially downgrading from `FULL_TRANSITIVE` to `BACKWARD` or `NONE` — is a breaking change risk. Any PR that sets `compatibility_override` must include a justification comment referencing the relevant ADR. See [ADR index](/compliance/adr-index) for the current set of approved exceptions.
+</Warning>
+
+## Related pages
+
+- [Topic onboarding guide](/governance/topic-onboarding) — step-by-step walkthrough for teams requesting a new topic
+- [Schema guide](/governance/schema-guide) — Avro schema conventions, naming rules, and evolution patterns
+- [SLA tiers](/governance/sla-tiers) — full specification of the four tiers and their governance implications
+- [DR runbook](/operations/dr-runbook) — failover and failback procedures that depend on the DR mirror topics this module provisions

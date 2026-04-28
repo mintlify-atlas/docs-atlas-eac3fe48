@@ -1,81 +1,249 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Get started with FSI Data Streaming Platform"
+description: "Deploy a fully governed Kafka/Flink/Schema Registry environment and onboard your first topic — from zero to production-ready in under an hour."
 ---
 
-## Get started in three steps
+The fastest path to a governed Kafka environment is to pick one of the eight deployment scenarios, supply your cluster credentials, and run the scenario's automation. This guide walks through the three scenario types — Confluent Cloud (Terraform), CFK on OpenShift (Helm/CFK), and CP on RHEL (Ansible) — and ends with onboarding your first topic using the shared governance module.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+<Note>
+All scenarios share these baseline requirements. Scenario-specific prerequisites (e.g., an OpenShift cluster or RHEL hosts) are listed in the tabs below.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Git access to the `fsi-kafka-platform` repository
+- A running Confluent cluster (Confluent Cloud org, OpenShift cluster, or RHEL hosts — depending on your scenario)
+- Terraform 1.5+ (Confluent Cloud and Private Cloud scenarios)
+- Ansible 9.x / core 2.16+ (CP on RHEL and CFK governance playbooks)
+- Helm 3.x (CFK on OpenShift scenario)
+- `confluent` CLI installed and authenticated
+</Note>
 
-### Step 2: Deploy your changes
+## Deploy the platform
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Tabs>
+  <Tab title="Confluent Cloud (Terraform)">
+    <Steps>
+      <Step title="Navigate to your scenario directory">
+        Choose the cloud provider that matches your Confluent Cloud deployment.
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+        ```bash
+        cd scenarios/cc-aws/          # or cc-azure/ or cc-gcp/
+        ```
+      </Step>
+      <Step title="Configure your environment">
+        Copy the example configuration files and fill in your cluster credentials.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+        ```bash
+        cp .env.example .env
+        cp clusters.auto.tfvars.example clusters.auto.tfvars
+        cp terraform.tfvars.example terraform.tfvars
+        ```
 
-### Step 3: Go live
+        Edit `clusters.auto.tfvars` with your Confluent Cloud cluster IDs and endpoints. Edit `terraform.tfvars` with your API keys and secrets.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+        Key variables in `.env`:
+
+        ```bash
+        CC_ORG_ID="org-xxxxx"
+        CC_ENV_ID="env-xxxxx"
+        CC_KAFKA_CLUSTER_ID="lkc-xxxxx"
+        CC_KAFKA_BOOTSTRAP="pkc-xxxxx.eastus2.azure.confluent.cloud:9092"
+        CC_SR_REST_ENDPOINT="https://psrc-xxxxx.eastus2.azure.confluent.cloud"
+        CC_DR_KAFKA_CLUSTER_ID="lkc-yyyyy"
+        CC_CLUSTER_LINK_NAME="cluster-link-bidir-prod-dr"
+        ```
+      </Step>
+      <Step title="Initialize and apply Terraform">
+        ```bash
+        terraform init && terraform apply
+        ```
+
+        Terraform provisions the Kafka topics, registers Avro schemas in Schema Registry, creates RBAC role bindings for producer and consumer service accounts, and configures DR mirror topics via Cluster Linking.
+      </Step>
+      <Step title="Verify the deployment">
+        ```bash
+        # List created topics
+        terraform output -json | jq 'keys'
+
+        # Inspect a specific topic
+        terraform output -json corebanking_account_txn
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="CFK on OpenShift (Helm/CFK)">
+    <Steps>
+      <Step title="Navigate to the CFK scenario directory">
+        ```bash
+        cd scenarios/cfk-openshift/
+        ```
+      </Step>
+      <Step title="Configure your environment">
+        ```bash
+        cp .env.example .env
+        ```
+
+        Set your OpenShift and Confluent Cloud credentials in `.env`. For CFK-specific settings, uncomment and fill in section 15 of `.env.example`:
+
+        ```bash
+        CFK_NAMESPACE=confluent
+        CFK_OPERATOR_VERSION=3.2
+        FSI_DR_BACKEND=mm2
+        FSI_MM2_CONNECT_URL=http://connect-mm2.confluent.svc.cluster.local:8083
+        ```
+      </Step>
+      <Step title="Install the CFK operator">
+        Install from Helm (recommended for production) or directly via OpenShift OperatorHub.
+
+        ```bash
+        helm repo add confluentinc https://packages.confluent.io/helm
+        helm repo update
+        helm upgrade --install confluent-operator \
+          confluentinc/confluent-for-kubernetes \
+          --namespace confluent --create-namespace
+        ```
+      </Step>
+      <Step title="Apply Kafka, Schema Registry, and Connect custom resources">
+        ```bash
+        oc apply -f values/kafka-rest-class.yaml
+        oc apply -f values/kafka.yaml
+        oc apply -f values/schemaregistry.yaml
+        oc apply -f values/connect.yaml
+        oc apply -f values/connect-mm2.yaml
+        ```
+
+        Wait for all pods to become Ready:
+
+        ```bash
+        oc get pods -n confluent -w
+        ```
+      </Step>
+      <Step title="Apply topic CRDs and ACLs">
+        ```bash
+        oc apply -f topics/
+        oc apply -f acls/acl-templates.yaml
+        ```
+      </Step>
+      <Step title="Run the governance playbook">
+        After the cluster is up, apply full governance via Ansible:
+
+        ```bash
+        ansible-playbook site.yml
+        ```
+
+        Use tags to apply selectively:
+
+        ```bash
+        ansible-playbook site.yml --tags topics      # topic governance only
+        ansible-playbook site.yml --tags rbac        # RBAC bindings only
+        ansible-playbook site.yml --check            # dry-run / audit mode
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="CP on RHEL (Ansible)">
+    <Steps>
+      <Step title="Navigate to the CP-RHEL scenario directory">
+        ```bash
+        cd scenarios/cp-rhel/
+        ```
+      </Step>
+      <Step title="Configure your environment">
+        ```bash
+        cp .env.example .env
+        cp inventory/hosts.yml.example inventory/hosts.yml
+        ```
+
+        Edit `inventory/hosts.yml` with your actual hostnames, IP addresses, and broker rack assignments. For CP-specific settings, uncomment section 16 of `.env`:
+
+        ```bash
+        CP_VERSION=7.6.0
+        CP_ANSIBLE_INVENTORY=scenarios/cp-rhel/inventory/hosts.yml
+        ```
+
+        Store sensitive values in Ansible Vault:
+
+        ```bash
+        ansible-vault create inventory/group_vars/vault.yml
+        ```
+      </Step>
+      <Step title="Install the cp-ansible collection">
+        ```bash
+        ansible-galaxy collection install confluent.platform
+        ```
+      </Step>
+      <Step title="Deploy the Confluent Platform cluster">
+        ```bash
+        ansible-playbook -i inventory/hosts.yml playbooks/deploy-cp.yml
+        ```
+
+        This deploys 3 Kafka brokers, 2 Schema Registry nodes, and 2 Connect workers — all with mTLS and MDS RBAC configured.
+      </Step>
+      <Step title="Run full governance orchestration">
+        ```bash
+        ansible-playbook site.yml
+        ```
+
+        The `site.yml` orchestration pipeline applies cluster configuration, topic governance, schema registration, RBAC bindings, connector setup, and observability in sequence. Run with `--check` for a dry-run audit before applying to production.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Onboard your first topic
+
+Once your cluster is running, add a governed topic using the shared topic module. The same declaration format works across all Terraform-based scenarios.
+
+<Steps>
+  <Step title="Fill out the intake form">
+    Copy `.github/ISSUE_TEMPLATE/new-topic-request.md` and fill in your domain, application, version, entity, owner email, SLA tier, data classification, PII fields, and producer/consumer service account IDs.
+  </Step>
+  <Step title="Add your Avro schema">
+    Place your `.avsc` file in `/schemas/{domain}-{entity}.avsc`. Follow the naming conventions in the [schema guide](/governance/schema-guide).
+  </Step>
+  <Step title="Add a module call">
+    Create or update a `.tf` file in `/environments/prod-east/`:
+
+    ```hcl
+    module "your_topic" {
+      source      = "../../modules/topic"
+      domain      = "your-domain"
+      application = "your-app"
+      schema_version = "v1"
+      entity         = "your-entity"
+      owner       = "your-team@fsi.org"
+      sla_tier    = "standard"
+      schema_file = "../../schemas/your-domain-your-entity.avsc"
+      pii_fields  = []
+      producer_service_accounts = ["sa-your-producer"]
+      consumer_service_accounts = ["sa-your-consumer"]
+      # ... infrastructure refs (copy from existing module call)
+    }
+    ```
+
+    The module automatically derives partitions, retention, schema compatibility mode, and DR mirror configuration from `sla_tier`. See [Topic onboarding](/governance/topic-onboarding) for all available parameters.
+  </Step>
+  <Step title="Submit a pull request">
+    Open a PR. The C4E pre-check CI job validates topic naming, SLA tier, schema compatibility, and RBAC before the PR reaches human review. C4E review target is same business day.
+  </Step>
+  <Step title="Merge and verify">
+    After approval, merging triggers `terraform apply`. Verify that the topic exists, the schema is registered, the DR mirror topic is created, and RBAC bindings are applied.
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Deployment models" icon="server" href="/deployment-models">
+    Compare all eight scenarios and get guidance on which model to choose.
+  </Card>
+  <Card title="Topic onboarding" icon="layer-group" href="/governance/topic-onboarding">
+    Full self-service intake workflow with all module parameters documented.
+  </Card>
+  <Card title="SLA tiers" icon="chart-bar" href="/governance/sla-tiers">
+    Understand how `critical`, `standard`, `best-effort`, and `compliance` tiers drive all config defaults.
+  </Card>
+  <Card title="DR runbook" icon="shield-halved" href="/operations/dr-runbook">
+    Failover and failback procedures for Cluster Linking, MirrorMaker 2, and Multi-Region Cluster.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

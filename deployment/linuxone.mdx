@@ -1,0 +1,403 @@
+---
+title: "Deploy on IBM LinuxONE (s390x): FIPS and HSM"
+description: "Deploy Confluent Platform and CFK on IBM LinuxONE s390x with FIPS 140-2 validation, IBM Semeru JDK, PKCS12 keystores, and CEX hardware security modules."
+---
+
+IBM LinuxONE (s390x architecture) introduces hardware-level cryptographic acceleration and strict FIPS 140-2 requirements that differ meaningfully from x86 deployments. The FSI Data Streaming Platform provides two LinuxONE-specific scenarios: `scenarios/cp-rhel-linuxone/` for Ansible-managed bare-metal RHEL, and `scenarios/cfk-openshift-linuxone/` for Helm-managed CFK on OpenShift. Both scenarios extend their base counterparts with s390x-specific JDK selection, PKCS12 MAC algorithm flags for cross-platform keystore portability, FIPS provider configuration, and optional CEX hardware security module support via PKCS#11. The `cp_mtls` Ansible role handles automated certificate provisioning — all private keys are generated directly on the target host to maintain FIPS boundary compliance.
+
+<Warning>
+  **FIPS prerequisites:** On IBM LinuxONE, FIPS must be enabled at LPAR provisioning time. For CFK on OpenShift, FIPS must be enabled at OCP cluster install time — post-install enablement is **not supported** on s390x. Attempting to enable FIPS after installation requires a full cluster rebuild. Verify `cat /proc/sys/crypto/fips_enabled` returns `1` before proceeding.
+</Warning>
+
+## s390x-specific considerations
+
+IBM LinuxONE differs from x86 in the following ways that affect Confluent Platform deployments:
+
+| Aspect | x86 (OpenJDK) | s390x (IBM Semeru) |
+|---|---|---|
+| JDK | OpenJDK 17 | IBM Semeru Runtime 17 (`java-17-ibm-semeru-openj9`) |
+| FIPS provider | Bouncy Castle FIPS (`BcFipsProviderCreator`) | `IBMJCEPlusFIPS` / `IBMJCEFIPS` (built-in) |
+| Keystore format | BCFKS (Bouncy Castle FIPS Keystore) | PKCS12 |
+| Crypto acceleration | Software-only (or AES-NI) | CPACF (hardware, transparent — no app changes needed) |
+| Provider config | `java.security` + BC FIPS JARs | `java.security` provider order (built-in) |
+| FIPS enablement (OCP) | Post-install possible | Must be enabled at cluster install time |
+| Endianness | Little-endian | Big-endian (s390x) |
+
+CPACF (CP Assist for Cryptographic Functions) accelerates AES, SHA, and other operations transparently. Its presence improves throughput but is not required for FIPS compliance.
+
+## Scenario: CP on RHEL on LinuxONE
+
+The `scenarios/cp-rhel-linuxone/` scenario extends `cp-rhel` with IBM Semeru JDK selection, PKCS12 MAC algorithm flags, and the `cp_mtls` role for automated certificate provisioning.
+
+### Prerequisites
+
+- IBM LinuxONE LPAR running RHEL 8.x or 9.x (s390x)
+- IBM Semeru Runtime 17 (`java-17-ibm-semeru-openj9`) on all target hosts
+- Ansible controller with network access to all target hosts
+- `community.crypto >= 2.15.0` collection: `ansible-galaxy collection install -r ../../ansible/requirements.yml`
+- `openssl` and `keytool` available on all target hosts
+
+### Group vars for s390x
+
+`scenarios/cp-rhel-linuxone/group_vars/all.yml` sets the architecture-specific defaults:
+
+```yaml
+confluent_package_version: "7.7.0"
+cp_architecture: s390x
+cp_jdk_vendor: ibm-semeru
+cp_jdk_version: "17"
+
+ssl_enabled: true
+ssl_mutual_auth_enabled: true
+rbac_enabled: true
+
+cp_mtls_ssl_keystore_type: PKCS12
+cp_mtls_ssl_truststore_type: PKCS12
+cp_mtls_keystore_backend: software
+
+# FIPS-aware PKCS12 MAC algorithm — prevents HmacPBESHA1 vs SHA-256 mismatch
+# when keystores cross x86/s390x boundaries
+cp_mtls_pkcs12_mac_flags: "-J-Dkeystore.pkcs12.macAlgorithm=HmacPBESHA256"
+
+fips_enabled: true
+jmxexporter_enabled: true
+```
+
+### Deploy mTLS certificates
+
+<Steps>
+  <Step title="Install collection dependencies">
+
+    ```bash
+    cd scenarios/cp-rhel-linuxone/
+    ansible-galaxy collection install -r ../../ansible/requirements.yml
+    ```
+
+  </Step>
+  <Step title="Copy and edit inventory">
+
+    ```bash
+    cp inventory/hosts.yml.example inventory/hosts.yml
+    $EDITOR inventory/hosts.yml
+    ```
+
+  </Step>
+  <Step title="Create and encrypt vault">
+
+    ```bash
+    cp group_vars/vault.yml.example group_vars/vault.yml
+    $EDITOR group_vars/vault.yml
+    ansible-vault encrypt group_vars/vault.yml
+    ```
+
+  </Step>
+  <Step title="Deploy mTLS certificates">
+
+    All private keys and keystores are generated directly on the target host — not on the Ansible controller — to maintain FIPS boundary compliance.
+
+    ```bash
+    ansible-playbook --ask-vault-pass playbooks/deploy-mtls.yml
+    ```
+
+  </Step>
+  <Step title="Verify mTLS">
+
+    ```bash
+    ansible-playbook --ask-vault-pass playbooks/verify-mtls.yml
+    ```
+
+  </Step>
+</Steps>
+
+## Scenario: CFK on OpenShift on LinuxONE
+
+The `scenarios/cfk-openshift-linuxone/` scenario extends `cfk-openshift` with `nodeAffinity` rules targeting `kubernetes.io/arch: s390x`, ensuring Kafka, Schema Registry, and Connect pods schedule on LinuxONE worker nodes.
+
+### Prerequisites
+
+- OpenShift Container Platform 4.x on s390x (or mixed-arch cluster with s390x workers)
+- FIPS enabled at OCP install time
+- CFK operator installed (Helm or OLM)
+- Confluent multi-arch container images (s390x variants are included)
+
+### Deploy on s390x
+
+```bash
+# Install CFK operator
+helm repo add confluentinc https://packages.confluent.io/helm
+helm install confluent-operator confluentinc/confluent-for-kubernetes \
+  -n confluent
+
+# Apply s390x-specific values
+helm upgrade confluent-operator confluentinc/confluent-for-kubernetes \
+  -n confluent -f values/kafka.yaml
+
+# Verify pods are running on s390x nodes
+oc get pods -n confluent -o wide
+```
+
+### s390x Helm values
+
+`values/kafka.yaml` sets `nodeAffinity` and tolerations for s390x scheduling:
+
+```yaml
+kafka:
+  replicas: 3
+  image:
+    pullPolicy: IfNotPresent   # Avoid unnecessary pulls with multi-arch images
+  podTemplate:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/arch
+                  operator: In
+                  values:
+                    - s390x
+    tolerations:
+      - key: "arch"
+        operator: "Equal"
+        value: "s390x"
+        effect: "NoSchedule"
+  tls:
+    enabled: true
+```
+
+<Note>
+  Remove the `nodeAffinity` and `tolerations` blocks if the cluster is s390x-only (no mixed-arch worker nodes). The affinity rules are only needed for mixed-arch clusters.
+</Note>
+
+## mTLS certificate provisioning on s390x
+
+The `cp_mtls` Ansible role automates the full certificate lifecycle for LinuxONE. Key requirements differ from x86:
+
+- **Generate on target:** All private keys and keystores must be generated on the target host. Cross-architecture keystores (x86-generated, s390x-loaded) fail with MAC algorithm mismatches on FIPS-enabled systems.
+- **PKCS12 only:** Do not use JKS. PKCS12 is the only format compatible with IBM JDK FIPS providers.
+- **Explicit algorithms:** Always specify `-keyalg RSA -keysize 2048 -sigalg SHA256withRSA`. IBM Semeru defaults differ from OpenJDK defaults.
+- **SAN requirements:** Every broker certificate must include DNS SANs for FQDN and short hostname, plus IP SAN. Missing SANs cause `ssl.endpoint.identification.algorithm=HTTPS` to reject connections.
+
+### Manual certificate steps (reference)
+
+<AccordionGroup>
+  <Accordion title="CA generation">
+
+    On the CA host:
+
+    ```bash
+    # Generate CA private key (RSA 4096, passphrase-protected)
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+      -aes256 -pass pass:$CA_PASSPHRASE -out ca-key.pem
+
+    # Generate self-signed CA certificate (10-year validity)
+    openssl req -new -x509 -key ca-key.pem -passin pass:$CA_PASSPHRASE \
+      -days 3650 -subj "/CN=FSI-Kafka-Root-CA/O=FSI/OU=Platform" \
+      -out ca-cert.pem
+    ```
+
+  </Accordion>
+  <Accordion title="Broker keystores">
+
+    On each broker, generate the key and CSR with SANs, then assemble the PKCS12 keystore:
+
+    ```bash
+    # Generate broker private key
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out broker0.key.pem
+
+    # Generate CSR with SANs (DNS FQDN, short hostname, IP)
+    openssl req -new -key broker0.key.pem \
+      -subj "/CN=broker0.kafka.fsi.internal/O=FSI/OU=Platform" \
+      -addext "subjectAltName=DNS:broker0.kafka.fsi.internal,DNS:broker0,IP:10.20.30.40" \
+      -addext "extendedKeyUsage=serverAuth,clientAuth" \
+      -out broker0.csr
+
+    # Assemble PKCS12 keystore (after signing on CA host)
+    openssl pkcs12 -export -in broker0-cert.pem -inkey broker0.key.pem \
+      -certfile ca-cert.pem -name broker0 \
+      -password pass:$KEYSTORE_PASSWORD \
+      -out broker0.keystore.p12
+    ```
+
+  </Accordion>
+  <Accordion title="Broker server.properties">
+
+    ```properties
+    ssl.keystore.type=PKCS12
+    ssl.keystore.location=/etc/kafka/ssl/broker0.keystore.p12
+    ssl.keystore.password=<password>
+    ssl.truststore.type=PKCS12
+    ssl.truststore.location=/etc/kafka/ssl/kafka.truststore.p12
+    ssl.truststore.password=<password>
+    ssl.client.auth=required
+    ssl.endpoint.identification.algorithm=HTTPS
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+## FIPS 140-2 validation
+
+Run the `validate-fips.yml` playbook to verify FIPS compliance on s390x. The playbook detects architecture and runs the appropriate checks automatically:
+
+```bash
+# On s390x: runs IBM provider + PKCS12 + CPACF checks
+ansible-playbook playbooks/validate-fips.yml
+```
+
+Manual validation checks:
+
+```bash
+# 1. OS-level FIPS
+cat /proc/sys/crypto/fips_enabled
+# Must return: 1
+
+# 2. IBM JDK FIPS providers
+java -XshowSettings:security 2>&1 | grep -i fips
+# Should show IBMJCEPlusFIPS or IBMJCEFIPS
+
+# 3. PKCS12 keystore loads successfully on FIPS-enabled system
+keytool -list -keystore /etc/kafka/ssl/broker0.keystore.p12 \
+  -storetype PKCS12 -storepass "${KEYSTORE_PASSWORD}"
+
+# 4. TLS handshake
+openssl s_client -connect broker0.kafka.fsi.internal:9093 \
+  -CAfile /etc/kafka/ssl/ca-cert.pem \
+  -verify_return_error -brief
+
+# 5. NTP skew (certificate validation is time-sensitive)
+chronyc sources -v
+# Offset should be < 1 second
+```
+
+If PKCS12 keystore loading fails with MAC algorithm errors, regenerate with explicit MAC flags:
+
+```bash
+keytool -importkeystore -srckeystore old.p12 -destkeystore new.p12 \
+  -deststoretype PKCS12 \
+  -J-Dkeystore.pkcs12.macAlgorithm=HmacPBESHA256 \
+  -J-Dkeystore.pkcs12.macIterationCount=100000
+```
+
+## CEX / HSM hardware security module
+
+IBM CEX cards enable hardware-backed private keys via PKCS#11. CEX support is optional — get software-based mTLS working first, then enable CEX if required.
+
+### Prerequisites
+
+- IBM CEX card visible to the LPAR: `lszcrypt -V` shows online adapters
+- `opencryptoki` package installed: `dnf install -y opencryptoki opencryptoki-libs`
+- PKCS#11 slot configured via `pkcsconf`
+
+### CCA vs EP11 mode
+
+| Mode | Use Case | Key Type |
+|---|---|---|
+| CCA | General-purpose crypto, key management | CCA keys (non-extractable) |
+| EP11 | Enterprise PKCS#11 compliance | EP11 keys (FIPS 140-2 Level 4) |
+
+EP11 mode is recommended for FIPS 140-2 Level 4 compliance.
+
+### Setup
+
+```bash
+# Verify CEX adapters are online
+lszcrypt -V
+# Should show: card0X type CEX[5-8] online
+
+# Initialize PKCS#11 slot
+pkcsconf -t    # List token info
+pkcsconf -I    # Initialize token (if new)
+pkcsconf -P    # Set user PIN
+
+# Generate RSA key pair in PKCS#11 slot
+pkcs11-tool --module /usr/lib64/pkcs11/PKCS11_API.so \
+  --keypairgen --key-type RSA:2048 \
+  --label broker0-key --id 01
+```
+
+### Kafka configuration for CEX
+
+```properties
+ssl.keystore.type=PKCS11
+ssl.keystore.location=NONE
+ssl.keystore.password=<PKCS11-user-PIN>
+# Truststore remains PKCS12 — CA cert does not need HSM protection
+ssl.truststore.type=PKCS12
+ssl.truststore.location=/etc/kafka/ssl/kafka.truststore.p12
+ssl.truststore.password=<truststore-password>
+```
+
+### Ansible integration
+
+Enable CEX mode in `group_vars/all.yml`:
+
+```yaml
+cp_mtls_keystore_backend: pkcs11
+cp_mtls_pkcs11_slot: 0
+cp_mtls_pkcs11_cex_mode: EP11   # or CCA
+cp_mtls_pkcs11_library: /usr/lib64/pkcs11/PKCS11_API.so
+```
+
+Revert to software keys by setting `cp_mtls_keystore_backend: software`. The `cp_mtls` role skips all PKCS#11 tasks when the backend is `software`.
+
+## Troubleshooting
+
+### Common issues checklist
+
+| Category | Issue | Symptom | Fix |
+|---|---|---|---|
+| SSL/JDK | `java.security` provider order | `NoSuchAlgorithmException` for standard algorithms | Verify provider order in `$JAVA_HOME/conf/security/java.security`: IBMJCE before SunJCE |
+| SSL/JDK | FIPS mode keystore rejection | `IOException: keystore was tampered with` | Regenerate with `-J-Dkeystore.pkcs12.macAlgorithm=HmacPBESHA256` |
+| SSL/JDK | Cross-platform keystore portability | x86-generated keystore fails on s390x | Regenerate on the FIPS host with explicit algorithm flags |
+| SSL/JDK | Cipher suite intersection empty | `SSLHandshakeException: no cipher suites in common` | Pin `ssl.cipher.suites` on both sides to a verified common set |
+| SSL/JDK | TLS 1.3 session resumption | Intermittent handshake failures | Force TLSv1.2 temporarily to diagnose; patch JDK to latest Semeru |
+| SSL/JDK | Missing SAN | `CertificateException: No subject alternative names` | Regenerate cert with DNS and IP SANs |
+| Non-SSL | LPAR time skew | `NotBefore`/`NotAfter` cert validation failures | Verify NTP: `chronyc sources` or `ntpstat` |
+| Non-SSL | Multi-arch sidecar images | Monitoring agents running x86 under QEMU (10x penalty) | Verify s390x-native sidecar builds are available |
+| Non-SSL | Endianness in custom serializers | Broken deserialization on s390x | Use Avro/Protobuf/JSON Schema (endian-safe) |
+
+### Per-component TLS debug
+
+Enable TLS debug logging by setting the appropriate environment variable before restarting the component:
+
+| Component | Debug variable |
+|---|---|
+| Kafka broker (inter-broker) | `KAFKA_OPTS="-Djavax.net.debug=ssl:handshake:verbose"` |
+| Schema Registry | `SCHEMA_REGISTRY_OPTS="-Djavax.net.debug=ssl:handshake"` |
+| Kafka Connect | `KAFKA_OPTS="-Djavax.net.debug=ssl:handshake"` |
+| Client applications | `JAVA_TOOL_OPTIONS="-Djavax.net.debug=ssl:handshake"` |
+
+### Collect a diagnostic bundle
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+BUNDLE_DIR="/tmp/kafka-diag-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "${BUNDLE_DIR}"
+
+java -version 2>&1 > "${BUNDLE_DIR}/java-version.txt"
+cat /proc/sys/crypto/fips_enabled > "${BUNDLE_DIR}/fips-enabled.txt" 2>/dev/null || echo "n/a" > "${BUNDLE_DIR}/fips-enabled.txt"
+grep -v password /etc/kafka/server.properties > "${BUNDLE_DIR}/server-properties-redacted.txt" 2>/dev/null || true
+lszcrypt -V > "${BUNDLE_DIR}/cex-adapters.txt" 2>/dev/null || echo "no CEX" > "${BUNDLE_DIR}/cex-adapters.txt"
+chronyc sources > "${BUNDLE_DIR}/ntp-sources.txt" 2>/dev/null || echo "no NTP info" > "${BUNDLE_DIR}/ntp-status.txt"
+
+tar czf "${BUNDLE_DIR}.tar.gz" -C /tmp "$(basename ${BUNDLE_DIR})"
+echo "Diagnostic bundle: ${BUNDLE_DIR}.tar.gz"
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Deploy CP on RHEL" href="/deployment/cp-rhel">
+    Base CP on RHEL scenario — inventory structure, Ansible roles, and site.yml orchestration.
+  </Card>
+  <Card title="Deploy CFK on OpenShift" href="/deployment/cfk-openshift">
+    Base CFK on OpenShift scenario — Helm values, KafkaTopic CRDs, and Flink operator.
+  </Card>
+  <Card title="FIPS validation" href="/compliance/fips-validation">
+    FIPS 140-2 compliance validation procedures and audit evidence collection.
+  </Card>
+  <Card title="Ansible roles reference" href="/reference/ansible-roles">
+    `cp_mtls` role variable reference and CEX/HSM configuration options.
+  </Card>
+</CardGroup>

@@ -1,0 +1,364 @@
+---
+title: "DR CLI reference: fsi-dr.sh commands and flags"
+description: "fsi-dr.sh command reference: failover, failback, and status with all flags and environment variables for Cluster Linking, MM2, and MRC backends."
+---
+
+`fsi-dr.sh` is the FSI platform's unified disaster recovery CLI. It replaces a manual six-step DR process with single-command orchestration for failover and failback, with a pluggable backend that supports Confluent Cluster Linking (`cluster-linking`), MirrorMaker 2 (`mm2`), and Multi-Region Clusters (`mrc`). Every command runs pre-flight checks, produces a state file with step-by-step progress, and prints rollback guidance if any step fails. The script can be dry-run to preview all operations before executing them.
+
+## Usage
+
+```bash
+fsi-dr.sh <command> [flags]
+```
+
+## Quick reference
+
+| Action | Command |
+|--------|---------|
+| Preview failover without changes | `fsi-dr.sh failover --dry-run` |
+| Execute failover | `fsi-dr.sh failover` |
+| Execute failover non-interactively | `fsi-dr.sh failover --force` |
+| Preview failback without changes | `fsi-dr.sh failback --dry-run` |
+| Execute failback | `fsi-dr.sh failback` |
+| Check mirror lag and status | `fsi-dr.sh status` |
+
+## Commands
+
+<Tabs>
+  <Tab title="failover">
+
+Orchestrates a 6-step DR failover sequence: pause connectors → promote mirrors → flip Consul → verify endpoints → resume connectors → final validation.
+
+```bash
+fsi-dr.sh failover [--dry-run] [--force]
+```
+
+**Failover steps:**
+
+| Step | Action | Description |
+|------|--------|-------------|
+| 1 | Pause connectors | Snapshot all connector states, pause all RUNNING connectors |
+| 2 | Promote mirrors | Promote all ACTIVE mirror topics to writable on DR cluster |
+| 3 | Flip Consul | `consul kv put fsi/kafka/active-region west` |
+| 4 | Verify endpoints | Poll DNS for `kafka.fsi.internal`, `schema.fsi.internal`, `oracle.fsi.internal` |
+| 5 | Resume connectors | Resume only connectors that were RUNNING before failover |
+| 6 | Final validation | Verify DR cluster accessible, mirrors promoted, Connect healthy |
+
+If any step fails, the state file is updated to `"status": "failed"` and rollback guidance is printed for the specific step. The script exits 1.
+
+**Mirror lag warning:** Before step 1 executes (non-dry-run), the script checks mirror lag against SLA tier thresholds. Topics exceeding their ALERT threshold trigger an interactive confirmation:
+
+```
+WARNING: 2 topic(s) exceed RPO alert threshold.
+Proceeding with failover may result in data loss for these topics.
+Acknowledge data loss risk and proceed? (yes/no):
+```
+
+  </Tab>
+  <Tab title="failback">
+
+Orchestrates an 8-step failback sequence that restores East as the primary cluster.
+
+```bash
+fsi-dr.sh failback [--dry-run] [--force]
+```
+
+**Failback steps:**
+
+| Step | Action | Description |
+|------|--------|-------------|
+| 1 | Verify East cluster | Confirm East is reachable before starting |
+| 2 | Pause connectors (West) | Snapshot and pause all RUNNING connectors on West |
+| 3 | Truncate and restore | **Destructive**: truncate East topics and restore as mirrors from West |
+| 4 | Wait for sync | Poll mirror lag until all topics are within SLA tier warn threshold |
+| 5 | Reverse and start | Make East topics R/W, West becomes the mirror |
+| 6 | Flip Consul | `consul kv put fsi/kafka/active-region east` |
+| 7 | Resume connectors | Resume connectors that were RUNNING before failback |
+| 8 | Final validation | Verify East accessible, Consul points east, Connect healthy |
+
+Step 3 (truncate-and-restore) requires a second interactive confirmation gate even when `--force` is not set, because truncation is irreversible. Step 5 (reverse-and-start) also has a confirmation gate. Both gates are suppressed with `--force`.
+
+  </Tab>
+  <Tab title="status">
+
+Displays current mirror lag, SLA tier assessments, and any in-progress DR operation.
+
+```bash
+fsi-dr.sh status
+```
+
+Sample output:
+
+```
+=== FSI DR Status ===
+
+Mirror Lag Status:
+
+  TOPIC                                              SLA TIER     LAG        THRESHOLD    STATUS
+  ------------------------------------------------------------------------------------------
+  corebanking.core.v1.account-transaction            critical     12s        60s          OK
+  fraud.detection.v1.alert-signal                    critical     75s        60s          ALERT
+  compliance.screening.v1.match-result               compliance   8s         30s          OK
+
+Summary: 2 topics OK, 0 WARN, 1 ALERT
+```
+
+**Lag thresholds by SLA tier:**
+
+| Tier | WARN threshold | ALERT threshold |
+|------|---------------|----------------|
+| `critical` | 30s | 60s |
+| `standard` | 5m (300s) | 15m (900s) |
+| `best-effort` | 1h (3600s) | 4h (14400s) |
+| `compliance` | 10s | 30s |
+
+  </Tab>
+</Tabs>
+
+## Flags
+
+<AccordionGroup>
+  <Accordion title="--dry-run">
+
+Preview all operations without executing. For failover and failback, prints a table of planned steps with current state and expected result:
+
+```
+STEP   ACTION                         CURRENT STATE                            EXPECTED RESULT
+----   ------                         -------------                            ---------------
+1      Pause Connectors               4 connectors (3 RUNNING)                 All RUNNING -> PAUSED
+2      Promote Mirrors                12 active mirror topics                  All mirrors -> writable
+3      Flip Consul                    active-region=east                       active-region=west
+4      Verify Endpoints               DNS: kafka.fsi.internal=10.0.1.5        Resolve to DR (west) IPs
+5      Resume Connectors              Connectors paused in Step 1              Resume RUNNING-only (3)
+6      Final Validation               DR cluster, mirrors, Connect             All verified healthy
+```
+
+For step 2, the dry-run also runs `confluent kafka mirror failover --dry-run` to show the Confluent CLI output.
+
+  </Accordion>
+  <Accordion title="--force">
+
+Skip all interactive confirmation prompts. Use in automation pipelines where operator input is not available. The flag does not bypass pre-flight checks or mirror lag assessment — it only auto-confirms the `Proceed? (yes/no)` prompts.
+
+```bash
+# CI/CD or on-call automation
+FSI_DR_ENV_ID=env-abc123 \
+FSI_DR_CLUSTER_ID=lkc-prod \
+FSI_DR_DR_ENV_ID=env-def456 \
+FSI_DR_DR_CLUSTER_ID=lkc-dr \
+fsi-dr.sh failover --force
+```
+
+  </Accordion>
+</AccordionGroup>
+
+## Environment variables
+
+### Required for all commands
+
+| Variable | Description |
+|----------|-------------|
+| `FSI_DR_ENV_ID` | Confluent Cloud environment ID for the production (East) environment |
+| `FSI_DR_CLUSTER_ID` | Confluent Cloud Kafka cluster ID for the production (East) cluster |
+| `FSI_DR_DR_ENV_ID` | Confluent Cloud environment ID for the DR (West) environment |
+| `FSI_DR_DR_CLUSTER_ID` | Confluent Cloud Kafka cluster ID for the DR (West) cluster |
+
+### Optional with defaults
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FSI_DR_BACKEND` | `cluster-linking` | DR backend: `cluster-linking`, `mm2`, or `mrc` |
+| `FSI_CONNECT_URL` | `http://localhost:8083` | Kafka Connect REST API endpoint |
+| `CONSUL_HTTP_ADDR` | `http://localhost:8500` | Consul HTTP API address |
+| `FSI_CLUSTER_LINK_NAME` | `cluster_link_bidir_east_west` | Bidirectional cluster link name |
+| `FSI_DR_STATE_FILE` | `/tmp/fsi-dr-state.json` | Path for the JSON operation state file |
+| `FSI_DR_SYNC_TIMEOUT` | `300` | Seconds to wait for mirror sync in failback step 4 |
+
+### MM2 backend variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FSI_MM2_CONNECT_URL` | `$FSI_CONNECT_URL` | Connect REST API for the MM2 dedicated cluster |
+| `FSI_MM2_SOURCE_CONNECTOR` | `mm2-source-east-west` | MirrorSourceConnector name |
+| `FSI_MM2_CHECKPOINT_CONNECTOR` | `mm2-checkpoint-east-west` | MirrorCheckpointConnector name |
+| `FSI_MM2_HEARTBEAT_CONNECTOR` | `mm2-heartbeat-east-west` | MirrorHeartbeatConnector name |
+| `FSI_MM2_SOURCE_ALIAS` | `east` | Source cluster alias |
+| `FSI_MM2_TARGET_ALIAS` | `west` | Target cluster alias |
+
+### MRC backend variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FSI_MRC_BOOTSTRAP` | `localhost:9092` | Bootstrap servers for the MRC cluster |
+| `FSI_MRC_EAST_RACK` | `us-east` | Rack ID for the East DC |
+| `FSI_MRC_WEST_RACK` | `us-west` | Rack ID for the West DC |
+| `FSI_MRC_OBSERVER_RACK` | `us-central` | Rack ID for observer/light DC |
+| `FSI_MRC_COMMAND_CONFIG` | *(empty)* | Path to command config properties file for auth |
+
+## Backend behavior
+
+<Tabs>
+  <Tab title="CL (Cluster Linking)">
+
+The `cluster-linking` backend uses the Confluent CLI `confluent kafka mirror` commands. Mirror topics are true read-only replicas that must be promoted to writable on failover.
+
+**Failover — mirror promotion:**
+
+```bash
+confluent kafka mirror failover <topics> \
+  --link cluster_link_bidir_east_west \
+  --cluster <FSI_DR_DR_CLUSTER_ID> \
+  --environment <FSI_DR_DR_ENV_ID> \
+  -o json
+```
+
+**Failback phase 1 — truncate and restore:**
+
+```bash
+confluent kafka mirror truncate-and-restore <topics> \
+  --link cluster_link_bidir_east_west \
+  --cluster <FSI_DR_CLUSTER_ID> \
+  --environment <FSI_DR_ENV_ID> \
+  -o json
+```
+
+**Failback phase 2 — reverse and start:**
+
+```bash
+confluent kafka mirror reverse-and-start <topics> \
+  --link cluster_link_bidir_east_west \
+  --cluster <FSI_DR_CLUSTER_ID> \
+  --environment <FSI_DR_ENV_ID> \
+  -o json
+```
+
+Pre-flight checks: production cluster reachable (WARN if not, expected during DR), DR cluster reachable (FAIL), active mirrors present (FAIL if count is 0), Connect API reachable, Consul reachable.
+
+  </Tab>
+  <Tab title="MM2 (MirrorMaker 2)">
+
+The `mm2` backend manages three MirrorMaker 2 connectors on a dedicated Connect cluster. Unlike Cluster Linking, MM2 DR topics are standard writable Kafka topics — no mirror promotion is needed. Failover pauses the connectors to stop replication, then flips Consul.
+
+**Failover — pause connectors:**
+
+```bash
+# The script pauses all three connectors via Connect REST API:
+# FSI_MM2_SOURCE_CONNECTOR (default: mm2-source-east-west)
+# FSI_MM2_CHECKPOINT_CONNECTOR (default: mm2-checkpoint-east-west)
+# FSI_MM2_HEARTBEAT_CONNECTOR (default: mm2-heartbeat-east-west)
+curl -s -X PUT ${FSI_MM2_CONNECT_URL}/connectors/${name}/pause
+```
+
+**Failback — reverse replication direction:**
+
+Failback deletes the existing connectors and creates reversed connectors (`mm2-source-west-east`, etc.) with swapped source and target bootstrap servers:
+
+```bash
+curl -s -X POST ${FSI_MM2_CONNECT_URL}/connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "mm2-source-west-east",
+    "config": {
+      "connector.class": "org.apache.kafka.connect.mirror.MirrorSourceConnector",
+      "source.cluster.alias": "west",
+      "target.cluster.alias": "east",
+      "source.cluster.bootstrap.servers": "<west-bootstrap>",
+      "target.cluster.bootstrap.servers": "<east-bootstrap>",
+      "topics": ".*",
+      "topics.exclude": ".*\\.internal,.*\\.replica,__.*",
+      "replication.factor": "3",
+      "sync.topic.configs.enabled": "true"
+    }
+  }'
+```
+
+MM2 pre-flight checks: MM2 Connect cluster reachable, `MirrorSourceConnector` and `MirrorCheckpointConnector` state (RUNNING=PASS, PAUSED=WARN, else FAIL), DR bootstrap reachable, Consul reachable.
+
+<Note>
+MM2 does not expose per-topic lag via the Connect REST API. The `status` command reports connector-level state. For per-partition lag granularity, use Prometheus/JMX metrics (`kafka.mirror.source.*`).
+</Note>
+
+  </Tab>
+  <Tab title="MRC (Multi-Region Cluster)">
+
+The `mrc` backend targets Confluent Platform Multi-Region Clusters with `observerPromotionPolicy: under-min-isr`. Observer replicas auto-promote when ISR drops below `min.insync.replicas`. The CLI triggers preferred leader election to move leadership to the surviving DC.
+
+**Failover — preferred leader election:**
+
+```bash
+kafka-leader-election.sh \
+  --bootstrap-server "${FSI_MRC_BOOTSTRAP}" \
+  --election-type PREFERRED \
+  --all-topic-partitions
+```
+
+MRC failover does not require mirror promotion (there are no mirror topics). Observers that promoted into ISR are already writable.
+
+**Failback — rebalance leaders to primary DC:**
+
+```bash
+# Verify primary DC brokers are back in ISR first, then:
+kafka-leader-election.sh \
+  --bootstrap-server "${FSI_MRC_BOOTSTRAP}" \
+  --election-type PREFERRED \
+  --all-topic-partitions
+```
+
+MRC pre-flight checks: bootstrap reachable, topic metadata readable, Consul reachable, `kafka-leader-election.sh` in PATH.
+
+<Note>
+MRC observer lag monitoring requires JMX metrics (`confluent.replicator.*`) or the `kafka-metadata.sh` tool. The `status` command reports aggregate cluster health; per-partition lag requires a Prometheus scrape.
+</Note>
+
+  </Tab>
+</Tabs>
+
+## State file
+
+Every non-dry-run failover and failback creates a JSON state file at `FSI_DR_STATE_FILE` (default: `/tmp/fsi-dr-state.json`). The file is atomically updated after each completed step using `mktemp + mv`.
+
+```json
+{
+  "operation": "failover",
+  "started": "2026-04-28T10:05:00Z",
+  "backend": "cluster-linking",
+  "steps_completed": [
+    {"step": 1, "name": "pause_connectors", "completed": "2026-04-28T10:05:12Z"},
+    {"step": 2, "name": "promote_mirrors",  "completed": "2026-04-28T10:05:45Z"}
+  ],
+  "topics_promoted": ["corebanking.core.v1.account-transaction", "fraud.detection.v1.alert-signal"],
+  "current_step": 2,
+  "status": "in-progress"
+}
+```
+
+Review the state file at any time:
+
+```bash
+fsi-dr.sh status
+# or directly:
+cat /tmp/fsi-dr-state.json | jq .
+```
+
+## Pre-flight checks
+
+Every command (failover, failback, status) runs pre-flight checks before executing. A failed pre-flight aborts with exit code 1 and an explanation.
+
+```bash
+=== Pre-flight Checks ===
+
+  PASS: Production cluster reachable
+  WARN: DR cluster unreachable (expected during DR)
+  PASS: 12 active mirrors found
+  PASS: Connect API reachable
+  PASS: Consul reachable
+
+Pre-flight: 4 passed, 1 warnings, 0 failed
+```
+
+## Related pages
+
+- [Operations: DR runbook](/operations/dr-runbook) — Step-by-step DR playbook with decision trees
+- [Deployment: Confluent Cloud](/deployment/confluent-cloud) — Cluster Linking setup
+- [Governance: SLA tiers](/governance/sla-tiers) — Lag thresholds per tier
+- [Compliance: ADR index](/compliance/adr-index) — ADR-008: DR Tier Classification

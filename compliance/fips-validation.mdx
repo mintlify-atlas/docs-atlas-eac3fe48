@@ -1,0 +1,200 @@
+---
+title: "FIPS 140-2 validation for Kafka and TLS on s390x"
+description: "Run validate-fips.sh to verify FIPS-enabled OpenSSL, IBM Java crypto, PKCS12 keystores, and TLS on Confluent Platform and CFK on OpenShift."
+---
+
+FIPS 140-2 compliance for Confluent Platform requires validating not only that the operating system is in FIPS mode, but also that the Java cryptographic providers, keystore formats, and TLS configuration are consistent with the FIPS boundary. On x86 systems this means Bouncy Castle FIPS (`BcFipsProviderCreator`) and BCFKS keystores. On IBM LinuxONE (s390x), the path is different: the IBM Semeru JDK provides `IBMJCEPlusFIPS` and `IBMJCEFIPS` as built-in FIPS providers, and PKCS12 replaces BCFKS as the required keystore format. The `validate-fips.sh` script covers both architectures and both deployment modes (CP on RHEL and CFK on OpenShift), giving you a single command that produces a pass/warn/fail summary across all relevant checks.
+
+<Warning>
+Running Confluent Platform without all FIPS checks passing does not automatically mean your deployment is non-compliant, but it does mean you must document the deviation and justify it to your compliance team. A `FAIL` on OS FIPS mode or a missing FIPS crypto provider is a hard finding in most FSI regulatory examinations. Do not deploy to production until all critical checks pass.
+</Warning>
+
+## What validate-fips.sh checks
+
+The script detects the execution mode from its first argument and runs the appropriate check set. It exits non-zero if any check produces `FAIL`, making it safe to use as a CI gate.
+
+### CP on RHEL (default mode)
+
+| Check | What it validates | Pass condition |
+|-------|------------------|----------------|
+| OS FIPS mode | `/proc/sys/crypto/fips_enabled` | Returns `1` |
+| Java version | Java 17 or 21 present | `java` found in PATH |
+| BCFKS keystore | `ssl.keystore.type=BCFKS` in broker, SR, and Connect configs | Present in all three config files |
+| BC FIPS provider | `BcFipsProviderCreator` in `server.properties` | Present in broker config |
+| IBM FIPS provider (s390x) | `IBMJCEPlusFIPS` or `IBMJCEFIPS` in JDK security settings | `java -XshowSettings:security` shows provider |
+| PKCS12 keystore (s390x) | `ssl.keystore.type=PKCS12` or `PKCS11` in configs | Present in all three config files |
+| CPACF detection (s390x) | MSA facility in `/proc/cpuinfo` | Informational — `WARN` if absent, not `FAIL` |
+| NTP skew (s390x) | `chronyc` or `ntpstat` shows time offset | Offset reported; `WARN` if no NTP client found |
+
+### CFK on OpenShift (`--cfk` flag)
+
+| Check | What it validates | Pass condition |
+|-------|------------------|----------------|
+| `oc` CLI | `oc` available in PATH | Command found |
+| Node FIPS mode | FIPS enabled on cluster nodes | `/proc/sys/crypto/fips_enabled` returns `1` on first node |
+| CFK Helm flag | `confluent-operator` deployment exists in target namespace | Deployment found; note to verify `--set fipsmode=true` at install |
+
+## Running the script
+
+### Validate CP on RHEL (local host)
+
+```bash
+scripts/validate-fips.sh
+```
+
+Expected output on a passing s390x system:
+
+```
+=== FIPS 140-2 Compliance Validation ===
+
+  Mode: CP on RHEL
+
+  [1] OS FIPS mode (/proc/sys/crypto/fips_enabled): PASS
+  [2] Java version: openjdk version "17.0.10" ...
+  [3] BCFKS keystore check:
+    /etc/kafka/server.properties: PASS
+    /etc/schema-registry/schema-registry.properties: PASS
+    /etc/kafka-connect/connect-distributed.properties: PASS
+  [4] BC FIPS provider in broker config: PASS
+
+  [5] Architecture-specific FIPS checks (s390x):
+    [5a] IBM FIPS provider: PASS -- IBM FIPS provider detected
+    [5b] PKCS12 keystore check (s390x uses PKCS12, not BCFKS):
+      /etc/kafka/server.properties: PASS
+      /etc/schema-registry/schema-registry.properties: PASS
+      /etc/kafka-connect/connect-distributed.properties: PASS
+    [5c] CPACF (CP Assist for Cryptographic Functions): DETECTED (hardware crypto acceleration available)
+    [5d] NTP time synchronization: offset=0.000123s (should be < 1s)
+
+=== Results: 10 passed, 0 warnings, 0 failed ===
+```
+
+### Validate CFK on OpenShift
+
+```bash
+scripts/validate-fips.sh --cfk
+```
+
+To target a non-default namespace, set `CFK_NAMESPACE` before running:
+
+```bash
+CFK_NAMESPACE=confluent-system scripts/validate-fips.sh --cfk
+```
+
+### Syntax check only (CI-safe, no host required)
+
+Use `--check` mode in CI environments where no Kafka host is available but you want to verify the script itself is syntactically valid:
+
+```bash
+scripts/validate-fips.sh --check
+```
+
+This exits 0 without running any host checks, making it safe for pull request pipelines that run on ephemeral runners without Kafka installed.
+
+## What each check validates in detail
+
+### OS-level FIPS mode
+
+The script reads `/proc/sys/crypto/fips_enabled`. A value of `1` confirms the kernel is operating in FIPS mode. If the value is `0` or the file is absent, the check fails with the remediation action:
+
+```bash
+# Remediation: enable FIPS mode and reboot
+fips-mode-setup --enable
+reboot
+```
+
+On OpenShift, FIPS mode must be enabled at cluster install time. Post-install enablement is not supported on OCP.
+
+### Java cryptographic provider
+
+On x86, the Bouncy Castle FIPS provider (`BcFipsProviderCreator`) must be declared in `server.properties`. On s390x, the IBM Semeru JDK includes `IBMJCEPlusFIPS` and `IBMJCEFIPS` as built-in providers. Verify the active provider list directly:
+
+```bash
+java -XshowSettings:security 2>&1 | grep -i fips
+```
+
+The output should list `IBMJCEPlusFIPS` or `IBMJCEFIPS` in the security provider order.
+
+### BCFKS vs PKCS12 keystore format
+
+x86 deployments use BCFKS (Bouncy Castle FIPS Keystore). s390x deployments must use PKCS12 — BCFKS is not supported by IBM JDK FIPS providers. The script checks `ssl.keystore.type` in three config files: `server.properties`, `schema-registry.properties`, and `connect-distributed.properties`.
+
+If a PKCS12 keystore fails to load with MAC algorithm errors on a FIPS system, regenerate it with a FIPS-compatible MAC:
+
+```bash
+keytool -importkeystore \
+  -srckeystore old.p12 \
+  -destkeystore new.p12 \
+  -deststoretype PKCS12 \
+  -J-Dkeystore.pkcs12.macAlgorithm=HmacPBESHA256 \
+  -J-Dkeystore.pkcs12.macIterationCount=100000
+```
+
+### TLS handshake verification
+
+To manually verify that TLS is working end-to-end with the FIPS-compliant configuration, run a TLS handshake against the broker directly:
+
+```bash
+openssl s_client -connect broker0.kafka.fsi.internal:9093 \
+  -CAfile /etc/kafka/ssl/ca-cert.pem \
+  -verify_return_error -brief
+```
+
+A successful handshake confirms that the broker's PKCS12 keystore loaded correctly, the CA cert is trusted, and the negotiated cipher suite is acceptable.
+
+### NTP time synchronization
+
+FIPS certificate validation is time-sensitive. The script checks NTP offset using `chronyc` or `ntpstat`. Offset should be under 1 second. To inspect sources manually:
+
+```bash
+chronyc sources -v
+```
+
+### CPACF detection (s390x, informational)
+
+CPACF (CP Assist for Cryptographic Functions) accelerates AES, SHA, and other operations transparently at the hardware level. The script checks for MSA (Message Security Assist) facility indicators in `/proc/cpuinfo`:
+
+```bash
+cat /proc/cpuinfo | grep -i "facilities"
+```
+
+CPACF presence improves performance but is not required for FIPS compliance. The check produces `WARN` if absent, not `FAIL`.
+
+## Automated validation in CI
+
+Add `validate-fips.sh` as a CI step in your post-deploy workflow. Use `--check` mode in PR pipelines (no host required) and full mode in post-deploy jobs that have SSH access to the target host.
+
+```yaml
+- name: Validate FIPS compliance
+  run: |
+    # Syntax check on PR (no host required)
+    scripts/validate-fips.sh --check
+
+- name: Validate FIPS compliance (post-deploy, CP on RHEL)
+  run: |
+    ssh deploy@kafka-broker-0 'bash -s' < scripts/validate-fips.sh
+```
+
+For CFK on OpenShift deployments, run the `--cfk` flag from a runner with `oc` CLI access to the cluster:
+
+```yaml
+- name: Validate FIPS compliance (CFK on OpenShift)
+  env:
+    CFK_NAMESPACE: confluent
+  run: scripts/validate-fips.sh --cfk
+```
+
+The script exits non-zero on any `FAIL`, causing the CI step to fail and blocking downstream deployment steps. `WARN` results do not fail the pipeline but are visible in the job output for manual review.
+
+## Key differences: x86 vs s390x
+
+| Aspect | x86 (OpenJDK) | s390x (IBM Semeru) |
+|--------|---------------|-------------------|
+| FIPS provider | Bouncy Castle FIPS (`BcFipsProviderCreator`) | `IBMJCEPlusFIPS` / `IBMJCEFIPS` |
+| Keystore format | BCFKS (Bouncy Castle FIPS Keystore) | PKCS12 |
+| Crypto acceleration | Software-only (or AES-NI) | CPACF (hardware, transparent) |
+| Provider configuration | `java.security` + BC FIPS JARs | `java.security` provider order (built-in to IBM Semeru) |
+| FIPS enablement (OS) | `fips-mode-setup --enable` + reboot | Same |
+| FIPS enablement (OCP) | Post-install possible | Must be enabled at cluster install time |
+
+For the full LinuxONE deployment setup including Ansible playbook configuration, IBM Semeru JDK installation, and CEX hardware security module integration, see [deployment/linuxone](/deployment/linuxone).

@@ -1,0 +1,132 @@
+---
+title: "FSI compliance: audit trail, controls, and framework mapping"
+description: "Map CI/CD steps to FSI control categories, navigate GitHub Actions audit evidence, and translate controls to OCC, PRA, MAS, APRA, and OSFI."
+---
+
+The FSI Data Streaming Platform embeds compliance controls directly into the CI/CD pipeline so that every infrastructure change — from topic creation to schema registration to RBAC binding — produces a traceable, examiner-ready evidence trail without any manual documentation effort. Each pull request, CI job, and Terraform apply generates artifacts in GitHub Actions that satisfy change management, segregation of duties, and audit logging requirements across major FSI regulatory frameworks. This guide is the starting point for navigating that evidence, whether you are a regulatory examiner verifying a specific change, an internal audit team preparing for an examination, or a platform engineer who wants to understand how compliance controls are built into the workflow.
+
+## Audience
+
+| Role | How to use this guide |
+|------|----------------------|
+| **Regulatory examiners** | Use the [audit trail flow](#audit-trail-flow) and [how to navigate an audit](#how-to-navigate-an-audit) sections to locate evidence for a specific change. The [control mapping table](#control-mapping) links each control category to its evidence location in GitHub. |
+| **Internal audit teams** | Use the [evidence checklist](#evidence-checklist) to verify controls for a given change before an examination. Use the [framework mapping table](#framework-mapping) to translate platform controls to your regulatory framework. |
+| **Platform engineers** | Use the [control mapping table](#control-mapping) to understand which workflow steps satisfy which controls, and the [glossary](#glossary) for terminology used throughout this guide. |
+
+## Audit trail flow
+
+Every change to a topic, schema, or RBAC configuration follows the same pipeline path. Each stage produces durable evidence in GitHub that examiners can review independently.
+
+```
+PR Created ──► CI Validation ──► Human Review ──► Merge to Main ──► Terraform Apply ──► Post-Apply Validation
+     │                │                │                │                   │                      │
+Change request   Automated checks  Segregation      Approval gate    Infrastructure          Verification
+                                   of duties                         deployment
+```
+
+Each step produces evidence in GitHub that an examiner can review:
+
+- **PR Created** — The pull request page shows the change request, description, and completed compliance checklist.
+- **CI Validation** — The GitHub Actions "Lint & Validate" job records automated checks: Terraform format, schema validation, compatibility check, and override detection.
+- **Human Review** — The PR review tab shows at least one approving review from a non-author, satisfying segregation of duties.
+- **Merge to Main** — The merge event confirms that required reviewers approved and all CI checks passed before merge.
+- **Terraform Apply** — The GitHub Actions "Terraform Apply" job records the infrastructure deployment, including every resource created or modified.
+- **Post-Apply Validation** — The "Compliance Audit Trail" job summary shows per-resource validation results: topic existence, schema registration, RBAC verification, and DR mirror status.
+
+## Control mapping
+
+The table below maps each workflow step to a generic FSI control category. See the [framework mapping](#framework-mapping) section to translate these categories to your specific regulatory framework.
+
+| Control category | Workflow step | Evidence location | What to look for |
+|-----------------|--------------|-------------------|-----------------|
+| Change Management | PR created with template | GitHub PR page | Completed checklist, description, linked issue |
+| Automated Validation | CI lint + validate + plan | GitHub Actions "Lint & Validate" job | `terraform fmt`, validate, schema validation all green |
+| Schema Governance | Schema compatibility check | GitHub Actions "Lint & Validate" job | SR compatibility check result (continue-on-error noted) |
+| Override Documentation | Compatibility override check | GitHub Actions "Lint & Validate" job | Override detection script output |
+| Access Control Review | PR template compliance checkboxes | GitHub PR page | RBAC verified checkbox checked, data classification reviewed |
+| Segregation of Duties | Human reviewer approval | GitHub PR review tab | At least one approving review from non-author |
+| Approval Gate | Branch protection merge | GitHub PR merge event | Required reviewers met, CI checks passed |
+| Deployment Automation | Terraform apply | GitHub Actions "Terraform Apply" job | Apply step succeeded, resources created |
+| Post-Deploy Verification | Post-apply validation | GitHub Actions job summary "Compliance Audit Trail" | All validation checks PASS |
+| Audit Logging | Job summary and annotations | GitHub Actions workflow run page | Timestamp, actor, commit SHA, run ID, validation results |
+
+## How to navigate an audit
+
+Follow these steps to trace any infrastructure change from the initial request to the deployed resource.
+
+<Steps>
+  <Step title="Open the Pull Requests tab">
+    Navigate to the GitHub repository's Pull Requests tab. Filter by "Merged" to see completed changes. Search by topic name, date range, or author to locate the change in question.
+  </Step>
+  <Step title="Review the PR description and checklist">
+    Open the PR page. The compliance review section of the description documents data classification, RBAC verification, and schema compatibility decisions made by the author at submission time.
+  </Step>
+  <Step title="Inspect the files changed">
+    Click the "Files changed" tab to see which Terraform, schema, or configuration files were modified. This establishes exactly what infrastructure was changed and provides the scope for the rest of the audit.
+  </Step>
+  <Step title="Verify segregation of duties">
+    Click the "Conversation" tab and locate the reviewer approval. At least one approving review from a non-author satisfies the segregation of duties control. GitHub branch protection rules enforce this requirement automatically.
+  </Step>
+  <Step title="Open the CI workflow run">
+    Click the CI status check link on the PR page to open the corresponding GitHub Actions workflow run. This is the entry point for all automated validation evidence.
+  </Step>
+  <Step title="Review the Lint & Validate job">
+    In the workflow run, open the "Lint & Validate" job. Examine the output for Terraform format checks, schema validation, Schema Registry compatibility checks, and override detection. All checks must be green.
+  </Step>
+  <Step title="Review the Terraform Apply job">
+    Open the "Terraform Apply" job to review the infrastructure deployment. The apply step output lists every resource created, updated, or deleted.
+  </Step>
+  <Step title="Review the Compliance Audit Trail">
+    At the bottom of the "Terraform Apply" job page, open the "Compliance Audit Trail" job summary. This shows the scenario, timestamp, actor, commit SHA, run ID, and per-resource validation results including topic existence, schema registration, RBAC verification, and DR mirror status.
+  </Step>
+  <Step title="Verify all validation checks pass">
+    Confirm that every validation check in the Compliance Audit Trail shows PASS. A single FAIL indicates a post-deploy state discrepancy that requires remediation before the change is considered fully compliant.
+  </Step>
+</Steps>
+
+## Evidence checklist
+
+<Note>
+Use this checklist to confirm that all controls are present for a given change before an examination or audit review.
+
+- PR created with completed compliance checklist (change management)
+- CI checks passed: Terraform format, schema validation, compatibility check (automated validation)
+- At least one non-author reviewer approved (segregation of duties)
+- Branch protection rules enforced at merge (approval gate)
+- Terraform apply succeeded with no resource errors (deployment automation)
+- Post-apply validation PASSED for all resources (post-deploy verification)
+- Job summary contains timestamp, actor, commit SHA, and run ID (audit logging)
+</Note>
+
+## Framework mapping
+
+The platform uses generic FSI control categories that map to multiple regulatory frameworks. The table below provides the primary mapping for each jurisdiction. Each institution should maintain an internal mapping document that cross-references these generic categories to their specific regulatory requirements and internal control IDs.
+
+| Framework | Jurisdiction | Change Management | Access Control | Audit Logging |
+|-----------|-------------|-------------------|---------------|---------------|
+| **OCC / FFIEC** | United States | IT Handbook — Development & Acquisition | IT Handbook — Information Security | IT Handbook — Audit |
+| **PRA** | United Kingdom | SS1/21 Operational Resilience; outsourcing and third-party risk management expectations | SS1/21 access and change controls | SS1/21 incident and change records |
+| **MAS** | Singapore | TRM Guidelines Section 6 (IT Project Management) and Section 7 (System Development) | TRM Section 9 (Access Controls) | TRM Section 12 (Audit Trails) |
+| **APRA** | Australia | CPS 234 Information Security — change management obligations | CPS 234 Paragraph 27 (access controls) | CPS 234 Paragraph 36 (testing and assurance evidence) |
+| **OSFI** | Canada | Guideline B-13 Technology and Cyber Risk Management — change management domain | B-13 identity and access management domain | B-13 logging and monitoring domain |
+
+## Glossary
+
+| Term | Definition |
+|------|-----------|
+| **PR (Pull Request)** | A request to merge code changes into the main branch. Every infrastructure change on this platform goes through a PR with a compliance checklist. |
+| **CI/CD** | Continuous Integration / Continuous Deployment. Automated pipelines that validate and deploy infrastructure changes without manual steps. |
+| **Terraform** | Infrastructure as Code tool that declaratively manages Confluent Cloud resources including topics, schemas, and RBAC bindings. |
+| **RBAC** | Role-Based Access Control. Controls which service accounts can produce to or consume from a given Kafka topic. |
+| **CSFLE** | Client-Side Field-Level Encryption. Encrypts individual fields in Kafka messages at the producer; only authorized consumers can decrypt. |
+| **SLA Tier** | Service Level Agreement classification (critical, standard, best-effort, compliance) that determines topic configuration defaults including compatibility mode and DR settings. |
+| **Data Classification** | Categorization of data sensitivity: confidential (PII, financial data), internal (business data), or public. |
+| **Schema Registry (SR)** | Service that stores and validates Avro schemas, enforcing compatibility rules to prevent breaking changes across producer and consumer upgrades. |
+| **Avro** | Binary data serialization format used for all Kafka message schemas on this platform. Supports schema evolution with configurable compatibility modes. |
+| **Compatibility Mode** | Schema Registry setting controlling what schema changes are allowed: FULL_TRANSITIVE, BACKWARD_TRANSITIVE, or BACKWARD. |
+| **DR (Disaster Recovery)** | Infrastructure and processes for recovering from regional outages. Uses Confluent Cluster Linking to replicate topics between active and passive clusters. |
+| **Cluster Linking** | Confluent Cloud feature that replicates topics between clusters in different regions for disaster recovery with bounded RPO. |
+| **PII** | Personally Identifiable Information. Data that can identify an individual (name, email, SSN, account number). PII fields are tagged in Avro schemas. |
+| **Service Account (SA)** | Identity used by applications to authenticate to Kafka and Schema Registry. Each service account has specific RBAC role bindings. |
+| **Job Summary** | GitHub Actions feature that displays structured output at the bottom of a workflow run page. Used for the Compliance Audit Trail. |
+| **Annotation** | GitHub Actions feature that surfaces notices and warnings at the workflow run level. Used for audit trail visibility alongside job summaries. |

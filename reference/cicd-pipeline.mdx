@@ -1,0 +1,371 @@
+---
+title: "CI/CD pipeline: C4E pre-check, schema validation, Terraform"
+description: "FSI platform CI/CD validates topic naming, Avro schemas, RBAC, and SLA tiers before Terraform plan on PR and apply on merge to main."
+---
+
+Every topic change on the FSI platform flows through a two-workflow GitHub Actions pipeline before any infrastructure is modified. Pull requests trigger the `plan` workflow, which runs lint, C4E pre-checks, Avro schema validation, override detection, and a Terraform plan. Merging to main triggers the `apply` workflow, which runs the same gates and then calls `terraform apply -auto-approve` followed by a post-apply validation and compliance audit summary. The reusable `terraform-scenario.yml` workflow is called by per-scenario wrappers (Azure, AWS, GCP), keeping the governance logic in one place.
+
+<Tip>
+Every apply generates a compliance audit trail in the GitHub Actions job summary: scenario path, actor, commit SHA, run ID, and validation results. This output satisfies the change-management evidence requirement documented in the [compliance guide](/compliance/compliance-guide).
+</Tip>
+
+## Two-workflow model
+
+The pipeline separates `plan` and `apply` into independent trigger contexts.
+
+<Tabs>
+  <Tab title="PR plan">
+
+```yaml
+# terraform-plan-azure.yml
+name: "Plan: CC-Azure"
+
+on:
+  pull_request:
+    paths:
+      - 'scenarios/cc-azure/**'
+      - 'modules/**'
+      - 'schemas/**'
+      - 'ci/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    uses: ./.github/workflows/terraform-scenario.yml
+    with:
+      scenario-dir: scenarios/cc-azure
+      mode: plan
+    secrets: inherit
+```
+
+The plan workflow is also defined for `cc-aws` and `cc-gcp` with matching path filters. All three call `terraform-scenario.yml` with `mode: plan`.
+
+  </Tab>
+  <Tab title="Merge apply">
+
+```yaml
+# terraform-apply-azure.yml
+name: "Apply: CC-Azure"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scenarios/cc-azure/**'
+      - 'modules/**'
+      - 'schemas/**'
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    uses: ./.github/workflows/terraform-scenario.yml
+    with:
+      scenario-dir: scenarios/cc-azure
+      environment-name: fsi-cc-azure
+      mode: apply
+    secrets: inherit
+```
+
+The `environment-name` field maps to a GitHub Environment with optional protection rules (required reviewers, deployment gates). The apply workflow is identical across `cc-azure`, `cc-aws`, and `cc-gcp` except for the scenario directory and environment name.
+
+  </Tab>
+</Tabs>
+
+## Reusable workflow structure
+
+`terraform-scenario.yml` is the authoritative governance workflow. It has three jobs: `lint`, `plan` (mode=plan only), and `apply` (mode=apply only).
+
+```yaml
+jobs:
+  # ── Lint & Validate ──
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf-version }}  # default: 1.7.0
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: ${{ inputs.scenario-dir }}
+
+      - name: Validate Topic Naming Convention
+        run: |
+          echo "Checking topic naming convention in Terraform files..."
+          for dir in environments/*/  scenarios/*/; do
+            if [ -d "$dir" ]; then
+              grep -h 'domain\s*=' "$dir"*.tf 2>/dev/null \
+                | sed 's/.*=\s*"\(.*\)"/\1/' \
+                | while read -r domain; do
+                    if ! echo "$domain" | grep -qP '^[a-z][a-z0-9-]{1,30}$'; then
+                      echo "ERROR: Invalid domain name: $domain (in $dir)"
+                      exit 1
+                    fi
+                  done
+            fi
+          done
+
+      - name: Validate Avro Schemas
+        run: python3 ci/scripts/validate-schemas.py --schemas-dir schemas/
+
+      - name: Check Schema Compatibility (SR)
+        if: inputs.mode == 'plan'
+        run: python3 ci/scripts/validate-schemas.py --schemas-dir schemas/ --check-compatibility
+        continue-on-error: true
+
+      - name: Check Compatibility Overrides
+        if: inputs.mode == 'plan'
+        run: bash ci/scripts/check-overrides.sh
+
+      - name: C4E Pre-Check Suite
+        if: inputs.mode == 'plan'
+        run: |
+          python3 ci/scripts/c4e-precheck.py \
+            --scenario-dir ${{ inputs.scenario-dir }} \
+            --schemas-dir schemas/ \
+            --verbose
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+        working-directory: ${{ inputs.scenario-dir }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ${{ inputs.scenario-dir }}
+```
+
+## C4E pre-check suite
+
+`ci/scripts/c4e-precheck.py` runs five automated governance checks against every topic module in the scenario directory. It parses Terraform `.tf` files, CFK `KafkaTopic` CRDs, and CP-RHEL `CPTopic` YAMLs — the same five checks apply to all deployment models.
+
+```
+python3 ci/scripts/c4e-precheck.py --scenario-dir scenarios/cc-aws/ --schemas-dir schemas/ --verbose
+```
+
+<AccordionGroup>
+  <Accordion title="Check 1: Naming Convention">
+
+Validates `domain`, `application`, `schema_version`, and `entity` fields against the FSI topic naming regex:
+
+| Field | Pattern |
+|-------|---------|
+| `domain` | `^[a-z][a-z0-9-]{1,30}$` |
+| `application` | `^[a-z][a-z0-9-]{1,30}$` |
+| `schema_version` | `^v[0-9]+$` |
+| `entity` | `^[a-z][a-z0-9-]{1,60}$` |
+
+A topic name is assembled as `{domain}.{application}.{schema_version}.{entity}`. Any component that fails its pattern causes the check to `FAIL`.
+
+  </Accordion>
+  <Accordion title="Check 2: Schema Compatibility">
+
+Loads the `.avsc` file referenced by `schema_file` and validates:
+
+- Valid JSON
+- `type == "record"`
+- Namespace present and matching `org.fsi.{domain}.{application}.v{N}`
+- All fields have `name` and `type`
+
+If `--check-compatibility` is passed, it also calls the live Schema Registry compatibility endpoint.
+
+```python
+NAMESPACE_PATTERN = re.compile(r'^org\.fsi\.[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*\.v[0-9]+$')
+```
+
+  </Accordion>
+  <Accordion title="Check 3: RBAC Completeness">
+
+Verifies that at least one producer service account is defined. For `data_classification = "confidential"` topics, at least one consumer service account is also required.
+
+```python
+# At least one producer SA must be set
+producer_sas = args.get('producer_service_accounts', [])
+producer_names = args.get('producer_sa_names', [])
+if not producer_sas and not producer_names:
+    errors.append("no producer service accounts defined")
+
+# For confidential topics, consumer SAs should also be set
+data_class = args.get('data_classification', 'internal')
+if data_class == 'confidential':
+    consumer_sas = args.get('consumer_service_accounts', [])
+    consumer_names = args.get('consumer_sa_names', [])
+    if not consumer_sas and not consumer_names:
+        errors.append("confidential topic requires consumer service accounts")
+```
+
+  </Accordion>
+  <Accordion title="Check 4: SLA Tier Consistency">
+
+Confirms that `retention_ms_override` and `partitions_override`, if set, do not fall below the tier minimums:
+
+| Tier | Min retention | Min partitions |
+|------|--------------|----------------|
+| `critical` | 604 800 000 ms (7 days) | 6 |
+| `standard` | 259 200 000 ms (3 days) | 3 |
+| `best-effort` | 86 400 000 ms (1 day) | 1 |
+| `compliance` | 220 898 482 000 ms (~7 years) | 3 |
+
+A retention override of `-1` (infinite) always passes.
+
+  </Accordion>
+  <Accordion title="Check 5: PII Field Audit">
+
+For `data_classification = "confidential"` Terraform topics, `pii_fields` must be non-empty. If `schema_file` is also present, each declared PII field is cross-checked against the schema field names.
+
+CFK and CP-RHEL topics pass this check automatically because PII declarations are carried in schema registration metadata, not in the CRD or YAML.
+
+  </Accordion>
+</AccordionGroup>
+
+The script exits 0 when all checks pass, or 1 if any check fails. CI blocks the PR merge on a non-zero exit.
+
+## Avro schema validation
+
+`ci/scripts/validate-schemas.py` validates all `.avsc` files found recursively under `schemas/`. It runs on every PR and apply, regardless of scenario.
+
+```bash
+# Structure + namespace validation (always)
+python3 ci/scripts/validate-schemas.py --schemas-dir schemas/
+
+# + live Schema Registry compatibility check (plan only)
+python3 ci/scripts/validate-schemas.py --schemas-dir schemas/ --check-compatibility
+```
+
+The script derives the Schema Registry subject name from the namespace and record name:
+
+```python
+def derive_subject_name(schema):
+    """
+    Example: org.fsi.cncb.core.v1 + AccountTransaction
+          -> cncb.core.v1.account-transaction-value
+    """
+    namespace = schema.get("namespace", "")
+    name = schema.get("name", "")
+    parts = namespace.split(".")
+    if len(parts) >= 5:
+        domain_app_version = ".".join(parts[2:])  # e.g., cncb.core.v1
+    else:
+        domain_app_version = namespace
+    kebab_name = re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()
+    return f"{domain_app_version}.{kebab_name}-value"
+```
+
+## Override detection
+
+`ci/scripts/check-overrides.sh` scans changed Terraform files in `environments/` and `scenarios/` for non-null `compatibility_override` assignments. If found, it requires the PR body to contain an ADR or JIRA reference.
+
+```bash
+# Look for non-null compatibility_override assignments
+# Matches: compatibility_override = "FULL_TRANSITIVE" (actual usage)
+# Does NOT match: compatibility_override = null, or variable declarations
+
+if [ -n "$OVERRIDE_FILES" ]; then
+  if echo "$PR_BODY" | grep -qE '(ADR-[0-9]+|[A-Z]{2,10}-[0-9]+)'; then
+    echo "OK: ADR/JIRA reference found in PR description."
+    exit 0
+  else
+    echo "ERROR: compatibility_override requires an ADR or JIRA reference in the PR description."
+    exit 1
+  fi
+fi
+```
+
+This enforces the governance requirement that every schema compatibility override is linked to an architectural decision record or change ticket.
+
+## Terraform plan and apply
+
+After the lint job passes, the plan job runs `terraform plan` and posts the output as a PR comment:
+
+```yaml
+- name: Comment Plan on PR
+  if: github.event_name == 'pull_request'
+  uses: actions/github-script@v7
+  with:
+    script: |
+      const plan = fs.readFileSync(planPath, 'utf8');
+      const truncated = plan.length > 60000
+        ? plan.substring(0, 60000) + '\n... (truncated)'
+        : plan;
+
+      const scenario = '${{ inputs.scenario-dir }}'.split('/').pop();
+      await github.rest.issues.createComment({
+        issue_number: context.issue.number,
+        body: `### Terraform Plan (\`${scenario}\`)\n\`\`\`\n${truncated}\n\`\`\`\n\n**Review required before merge.**`
+      });
+```
+
+The apply job uses `environment: ${{ inputs.environment-name }}` to enforce GitHub Environment protection rules before `terraform apply -auto-approve` runs.
+
+## Post-apply validation
+
+After `terraform apply` succeeds, the workflow runs `scripts/validate-apply.sh` to verify every deployed resource:
+
+```bash
+scripts/validate-apply.sh \
+  <kafka-rest-endpoint> <cluster-id> \
+  <sr-rest-endpoint> \
+  <kafka-key> <kafka-secret> <sr-key> <sr-secret> \
+  [--dr-rest <url> --dr-cluster <id> --dr-key <key> --dr-secret <secret>] \
+  --topics topic1 topic2 ...
+```
+
+The script checks: topic exists on the cluster, schema is registered in Schema Registry, RBAC role bindings are present, and (if DR is configured) the mirror topic exists on the DR cluster. It exits `0` on full pass and `1` if any check fails, blocking the workflow.
+
+## Compliance audit trail
+
+After every apply, the workflow writes a structured summary to the GitHub Actions job summary:
+
+```yaml
+- name: Write Compliance Audit Summary
+  if: always() && inputs.mode == 'apply'
+  run: |
+    {
+      echo "## Terraform Apply -- Compliance Audit Trail"
+      echo "| Property | Value |"
+      echo "|----------|-------|"
+      echo "| Scenario | \`${{ inputs.scenario-dir }}\` |"
+      echo "| Timestamp | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+      echo "| Actor | ${{ github.actor }} |"
+      echo "| Commit SHA | \`${{ github.sha }}\` |"
+      echo "| Run ID | [${{ github.run_id }}](...) |"
+    } >> "$GITHUB_STEP_SUMMARY"
+```
+
+A GitHub Actions notice annotation is also emitted:
+
+```
+::notice title=Audit Trail::Terraform apply completed for scenarios/cc-azure
+  by alice at 2026-04-28T10:00:00Z. Commit: abc1234
+```
+
+## Required secrets
+
+All secrets are passed from the calling workflow via `secrets: inherit`. The following secrets must be configured in the repository or GitHub Environment:
+
+| Secret | Used by |
+|--------|---------|
+| `CONFLUENT_CLOUD_API_KEY` | Terraform init and plan/apply |
+| `CONFLUENT_CLOUD_API_SECRET` | Terraform init and plan/apply |
+| `KAFKA_API_KEY` | Terraform plan/apply (producer SA binding) |
+| `KAFKA_API_SECRET` | Terraform plan/apply |
+| `SR_API_KEY` | Schema Registry compatibility check |
+| `SR_API_SECRET` | Schema Registry compatibility check |
+| `DR_KAFKA_API_KEY` | DR cluster plan/apply (optional) |
+| `DR_KAFKA_API_SECRET` | DR cluster plan/apply (optional) |
+
+## Related pages
+
+- [Governance: topic onboarding](/governance/topic-onboarding) — PR-based intake process
+- [Governance: schema guide](/governance/schema-guide) — Schema evolution and compatibility modes
+- [Governance: SLA tiers](/governance/sla-tiers) — Retention and partition minimums
+- [Compliance: compliance guide](/compliance/compliance-guide) — Audit trail requirements
+- [Reference: Terraform topic module](/reference/topic-module)

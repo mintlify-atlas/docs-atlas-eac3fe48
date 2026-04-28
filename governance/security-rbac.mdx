@@ -1,0 +1,440 @@
+---
+title: "Security and RBAC: mTLS, role bindings, and encryption"
+description: "Service account declarations, Confluent RBAC role bindings, mTLS configuration, CSFLE field-level encryption, and secrets management for FSI platform topics."
+---
+
+Every topic on the FSI Data Streaming Platform is secured by default: RBAC role bindings are applied automatically by the topic module, mTLS is enforced at the Confluent Cloud network layer, and topics classified as `confidential` require client-side field-level encryption via CSFLE. Teams declare their service accounts in the Terraform module call and receive the correct role bindings without writing any Confluent IAM configuration themselves. The platform's security posture is enforced at apply time — topics cannot be created without at least one producer service account, and confidential topics cannot be created without PII fields, a KEK name, and a KMS provider configured.
+
+<Warning>
+  Topics with `data_classification = "confidential"` are subject to mandatory CSFLE encryption enforced by Terraform preconditions. The module will reject the configuration at plan time if any of the following are missing: `pii_fields` (non-empty), `kek_name`, `csfle_kms_type`, and `csfle_kms_key_id`. Additionally, confidential topics must have at least one consumer service account — open access is not permitted.
+</Warning>
+
+## RBAC role bindings
+
+The topic module applies Confluent RBAC role bindings for every service account declared in the module call. Bindings are scoped to the exact topic and schema subject — no account has cluster-wide access.
+
+### Producer bindings
+
+Producers receive `DeveloperWrite` on the topic resource and `DeveloperWrite` on the schema subject (to allow schema auto-registration):
+
+```hcl
+resource "confluent_role_binding" "producer" {
+  for_each = toset(local.effective_producer_sa_ids)
+
+  principal   = "User:${each.value}"
+  role_name   = "DeveloperWrite"
+  crn_pattern = "${var.kafka_cluster_crn}/kafka=${var.kafka_cluster_id}/topic=${local.topic_name}"
+}
+
+resource "confluent_role_binding" "sr_write" {
+  for_each = toset(local.effective_producer_sa_ids)
+
+  principal   = "User:${each.value}"
+  role_name   = "DeveloperWrite"
+  crn_pattern = "${var.schema_registry_cluster_crn}/subject=${local.value_subject}"
+}
+```
+
+### Consumer bindings
+
+Consumers receive `DeveloperRead` on the topic, `DeveloperRead` on their consumer group (scoped to groups matching `{sa_id}-*`), and `DeveloperRead` on the schema subject:
+
+```hcl
+resource "confluent_role_binding" "consumer" {
+  for_each = toset(local.effective_consumer_sa_ids)
+
+  principal   = "User:${each.value}"
+  role_name   = "DeveloperRead"
+  crn_pattern = "${var.kafka_cluster_crn}/kafka=${var.kafka_cluster_id}/topic=${local.topic_name}"
+}
+
+resource "confluent_role_binding" "consumer_group" {
+  for_each = toset(local.effective_consumer_sa_ids)
+
+  principal   = "User:${each.value}"
+  role_name   = "DeveloperRead"
+  crn_pattern = "${var.kafka_cluster_crn}/kafka=${var.kafka_cluster_id}/group=${each.value}-*"
+}
+```
+
+### Declaring service accounts in the module
+
+Teams declare service accounts using one of two modes:
+
+**Reference mode** (most common): pass existing Confluent Cloud service account IDs directly.
+
+```hcl
+module "cncb_account_txn" {
+  source = "../../modules/topic"
+
+  producer_service_accounts = ["sa-cncb-producer"]
+  consumer_service_accounts = ["sa-cncb-consumer", "sa-rtfd-enrichment"]
+
+  create_service_accounts = false   # default
+  # ...
+}
+```
+
+**Create mode**: the module creates new service accounts using the display names provided.
+
+```hcl
+module "cncb_account_txn" {
+  source = "../../modules/topic"
+
+  create_service_accounts = true
+  producer_sa_names       = ["cncb-core-producer"]
+  consumer_sa_names       = ["cncb-core-consumer", "rtfd-enrichment-consumer"]
+  # ...
+}
+```
+
+In create mode, the module creates `confluent_service_account` resources and wires their IDs into the role bindings automatically. Use create mode when provisioning a net-new application that does not yet have service accounts in Confluent Cloud. Use reference mode when integrating with service accounts that already exist.
+
+## mTLS configuration
+
+Confluent Cloud enforces TLS for all client connections. For Confluent for Kubernetes (CFK) and Confluent Platform (CP) deployments, mutual TLS (mTLS) is configured at the listener level so that both the broker and the client authenticate with certificates.
+
+<Tabs>
+  <Tab title="Confluent Cloud">
+    Confluent Cloud manages TLS termination. Clients authenticate with API key and secret over SASL_SSL. No client certificate is required — authentication is handled by the SASL OAUTHBEARER or PLAIN mechanism.
+
+    ```properties
+    bootstrap.servers=pkc-xxxxx.us-east-1.aws.confluent.cloud:9092
+    security.protocol=SASL_SSL
+    sasl.mechanism=OAUTHBEARER
+    sasl.login.callback.handler.class=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler
+    ```
+
+    PrivateLink and VPC peering deployments add network-layer isolation. The platform provisions PrivateLink endpoints in the `environments/` configuration — consult the [Confluent Cloud deployment guide](/deployment/confluent-cloud) for network configuration details.
+  </Tab>
+
+  <Tab title="CFK on OpenShift">
+    Confluent for Kubernetes deployments on OpenShift use mTLS for broker-to-broker and client-to-broker communication. The CFK operator manages certificate lifecycle via cert-manager.
+
+    ```yaml
+    apiVersion: platform.confluent.io/v1beta1
+    kind: Kafka
+    spec:
+      listeners:
+        internal:
+          tls:
+            enabled: true
+        external:
+          tls:
+            enabled: true
+          authentication:
+            type: mtls
+            principalMappingRules:
+              - "RULE:^CN=([a-zA-Z0-9.-]+).*$/$1/"
+              - "DEFAULT"
+    ```
+
+    Client keystores and truststores are provisioned as Kubernetes secrets and mounted by the application pods. See the [CFK on OpenShift deployment guide](/deployment/cfk-openshift) for the full certificate provisioning workflow.
+  </Tab>
+
+  <Tab title="Confluent Platform on RHEL">
+    Confluent Platform on RHEL configures mTLS in `server.properties`. The FSI Ansible roles manage certificate distribution and listener configuration.
+
+    ```properties
+    listeners=SSL://0.0.0.0:9093
+    advertised.listeners=SSL://broker.fsi.internal:9093
+    ssl.keystore.location=/etc/kafka/ssl/kafka.server.keystore.jks
+    ssl.keystore.password=${vault:secret/kafka/keystore-password}
+    ssl.key.password=${vault:secret/kafka/key-password}
+    ssl.truststore.location=/etc/kafka/ssl/kafka.server.truststore.jks
+    ssl.truststore.password=${vault:secret/kafka/truststore-password}
+    ssl.client.auth=required
+    ```
+
+    Credentials are injected from HashiCorp Vault at Ansible execution time using the `${vault:...}` interpolation syntax. See the [Confluent Platform on RHEL deployment guide](/deployment/cp-rhel) for the certificate authority setup.
+  </Tab>
+</Tabs>
+
+## CSFLE field-level encryption
+
+Client-Side Field-Level Encryption (CSFLE) protects PII fields at the producer before the message reaches the Kafka broker. The broker stores and replicates encrypted bytes — it never sees plaintext PII. Only consumers with access to the Key Encryption Key (KEK) in the configured KMS can decrypt PII fields.
+
+CSFLE uses envelope encryption:
+- A **KEK** is stored in a KMS (AWS KMS, Azure Key Vault, GCP Cloud KMS, or HashiCorp Vault Transit).
+- A **DEK** (Data Encryption Key) is generated automatically by the Confluent Schema Registry DEK Registry.
+- The KEK wraps the DEK; the DEK encrypts individual fields tagged `PII` in the schema.
+
+### Enabling CSFLE via the topic module
+
+Set `data_classification = "confidential"` and provide the KMS configuration. The module creates the KEK registration and attaches the encryption ruleset to the schema subject automatically.
+
+```hcl
+module "compliance_screening_result" {
+  source = "../../modules/topic"
+
+  domain         = "compliance"
+  application    = "screening"
+  schema_version = "v1"
+  entity         = "result"
+  sla_tier       = "critical"
+  owner          = "compliance-team@fsi.org"
+  schema_file    = "../../schemas/examples/compliance-match-result.avsc"
+
+  data_classification = "confidential"
+  pii_fields          = ["member_name", "matched_name"]
+
+  kek_name         = "compliance-pii-kek"
+  csfle_kms_type   = "aws-kms"
+  csfle_kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789abc"
+
+  producer_service_accounts = ["sa-compliance-producer"]
+  consumer_service_accounts = ["sa-compliance-consumer", "sa-audit-reader"]
+  # ...
+}
+```
+
+### KMS provider configuration
+
+<Tabs>
+  <Tab title="AWS KMS">
+    Grant the Confluent Cloud Schema Registry service principal `kms:Encrypt`, `kms:Decrypt`, and `kms:GenerateDataKey` on the key.
+
+    **Key ID format:** full ARN
+    ```
+    arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789abc
+    ```
+
+    **IAM key policy:**
+    ```json
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::CONFLUENT_ACCOUNT_ID:root"
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*"
+    }
+    ```
+
+    Set `csfle_kms_type = "aws-kms"` in the module call.
+  </Tab>
+
+  <Tab title="Azure Key Vault">
+    Grant the Confluent Cloud service principal `Wrap Key` and `Unwrap Key` permissions on the Key Vault key.
+
+    **Key ID format:** full Key Identifier URI including version
+    ```
+    https://my-keyvault.vault.azure.net/keys/my-key/1234567890abcdef
+    ```
+
+    Create an RSA key (2048-bit or higher). Set `csfle_kms_type = "azure-kms"` in the module call.
+  </Tab>
+
+  <Tab title="GCP Cloud KMS">
+    Grant the Confluent Cloud service account the `cloudkms.cryptoKeyEncrypterDecrypter` IAM role on the key.
+
+    **Key ID format:** full resource name
+    ```
+    projects/my-project/locations/us-central1/keyRings/my-keyring/cryptoKeys/my-key
+    ```
+
+    Set `csfle_kms_type = "gcp-kms"` in the module call.
+  </Tab>
+
+  <Tab title="HashiCorp Vault">
+    Configure a Vault Transit secrets engine with an RSA-2048 encryption key. Grant encrypt and decrypt capabilities via Vault policy.
+
+    **Key ID format:** Vault transit path
+    ```
+    vault://transit/keys/my-csfle-key
+    ```
+
+    ```bash
+    vault secrets enable transit
+    vault write -f transit/keys/my-csfle-key type=rsa-2048
+    ```
+
+    Set `csfle_kms_type = "hcvault"` in the module call.
+  </Tab>
+</Tabs>
+
+### Client configuration for CSFLE
+
+Producers and consumers must add the CSFLE rule executor to their Kafka client configuration.
+
+**Java producer:**
+```properties
+rule.executors=io.confluent.kafka.schemaregistry.encryption.FieldEncryptionExecutor
+rule.executors.io.confluent.kafka.schemaregistry.encryption.FieldEncryptionExecutor.param.kek.name=compliance-pii-kek
+rule.actions=io.confluent.kafka.schemaregistry.rules.RuleAction
+value.serializer=io.confluent.kafka.serializers.KafkaAvroSerializer
+```
+
+**Java consumer:**
+```properties
+rule.executors=io.confluent.kafka.schemaregistry.encryption.FieldEncryptionExecutor
+rule.actions=io.confluent.kafka.schemaregistry.rules.RuleAction
+value.deserializer=io.confluent.kafka.serializers.KafkaAvroDeserializer
+```
+
+Add the encryption client library to your Maven dependencies:
+
+```xml
+<dependency>
+  <groupId>io.confluent</groupId>
+  <artifactId>kafka-schema-registry-client-encryption</artifactId>
+  <version>7.6.0</version>
+</dependency>
+```
+
+<Note>
+  CSFLE requires the **Stream Governance Advanced** package on Confluent Cloud. Schema registration with encryption rules will fail with "encryption rules not supported" if the package is not enabled on the environment.
+</Note>
+
+## Secrets management
+
+Infrastructure credentials (Kafka API keys, Schema Registry API keys, and DR cluster credentials) are stored and injected via the secrets management platform configured for each cloud deployment. The topic module declares all credential variables as `sensitive = true` — Terraform redacts them from plan output and state display.
+
+<Tabs>
+  <Tab title="HashiCorp Vault">
+    Vault is the preferred secrets manager for on-premises and hybrid deployments (CFK on OpenShift, Confluent Platform on RHEL).
+
+    ```bash
+    # Store Kafka API credentials in Vault
+    vault kv put secret/kafka/prod-east \
+      api_key="KAFKA_API_KEY" \
+      api_secret="KAFKA_API_SECRET"
+    ```
+
+    Reference in Ansible playbooks using the `${vault:secret/...}` interpolation syntax. For Terraform, use the Vault provider to read secrets at plan time:
+
+    ```hcl
+    data "vault_kv_secret_v2" "kafka_east" {
+      mount = "secret"
+      name  = "kafka/prod-east"
+    }
+
+    module "my_topic" {
+      kafka_api_key    = data.vault_kv_secret_v2.kafka_east.data["api_key"]
+      kafka_api_secret = data.vault_kv_secret_v2.kafka_east.data["api_secret"]
+      # ...
+    }
+    ```
+  </Tab>
+
+  <Tab title="Azure Key Vault">
+    For Confluent Cloud deployments on Azure, store Kafka and Schema Registry API credentials in Azure Key Vault secrets.
+
+    ```bash
+    az keyvault secret set \
+      --vault-name fsi-dsp-keyvault \
+      --name kafka-east-api-key \
+      --value "KAFKA_API_KEY"
+    ```
+
+    Reference in Terraform using the `azurerm_key_vault_secret` data source:
+
+    ```hcl
+    data "azurerm_key_vault_secret" "kafka_api_key" {
+      name         = "kafka-east-api-key"
+      key_vault_id = data.azurerm_key_vault.this.id
+    }
+    ```
+  </Tab>
+
+  <Tab title="AWS Secrets Manager">
+    For Confluent Cloud deployments on AWS, store credentials in AWS Secrets Manager.
+
+    ```bash
+    aws secretsmanager create-secret \
+      --name fsi-dsp/kafka/prod-east \
+      --secret-string '{"api_key":"KAFKA_API_KEY","api_secret":"KAFKA_API_SECRET"}'
+    ```
+
+    Reference in Terraform using the `aws_secretsmanager_secret_version` data source:
+
+    ```hcl
+    data "aws_secretsmanager_secret_version" "kafka_east" {
+      secret_id = "fsi-dsp/kafka/prod-east"
+    }
+
+    locals {
+      kafka_creds = jsondecode(data.aws_secretsmanager_secret_version.kafka_east.secret_string)
+    }
+    ```
+  </Tab>
+
+  <Tab title="GCP Secret Manager">
+    For Confluent Cloud deployments on GCP, store credentials in Google Secret Manager.
+
+    ```bash
+    echo -n "KAFKA_API_KEY" | gcloud secrets create kafka-east-api-key \
+      --data-file=-
+    ```
+
+    Reference in Terraform using the `google_secret_manager_secret_version` data source:
+
+    ```hcl
+    data "google_secret_manager_secret_version" "kafka_api_key" {
+      secret = "kafka-east-api-key"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## RBAC approach by deployment model
+
+<Tabs>
+  <Tab title="Confluent Cloud">
+    Confluent Cloud RBAC uses Confluent Resource Names (CRNs) to scope role bindings. The topic module manages all RBAC via `confluent_role_binding` resources. No manual configuration in the Confluent Cloud console is needed or supported.
+
+    - Producers: `DeveloperWrite` on `crn://...kafka={cluster_id}/topic={topic_name}`
+    - Consumers: `DeveloperRead` on topic + consumer group CRN
+    - Schema Registry: `DeveloperRead` and `DeveloperWrite` scoped to the exact schema subject CRN
+
+    The Confluent Terraform provider v2.0+ is required. All CC scenarios in the `environments/` directory pin to `~> 2.0`.
+  </Tab>
+
+  <Tab title="CFK on OpenShift">
+    Confluent for Kubernetes uses Confluent RBAC with the MDS (Metadata Service). Role bindings are declared as `ConfluentRolebinding` custom resources and applied by the CFK operator.
+
+    ```yaml
+    apiVersion: platform.confluent.io/v1beta1
+    kind: ConfluentRolebinding
+    metadata:
+      name: cncb-producer-write
+      namespace: confluent
+    spec:
+      principal:
+        name: cncb-producer
+        type: user
+      role: DeveloperWrite
+      resourcePatterns:
+        - name: cncb.core.v1.account-transaction
+          patternType: LITERAL
+          resourceType: Topic
+    ```
+
+    See the [CFK on OpenShift deployment guide](/deployment/cfk-openshift) for MDS setup and the operator lifecycle configuration.
+  </Tab>
+
+  <Tab title="Confluent Platform on RHEL">
+    Confluent Platform uses MDS-backed RBAC via the Confluent CLI. Role assignments are managed by the FSI Ansible roles and applied during cluster configuration.
+
+    ```bash
+    # Grant DeveloperWrite to a producer service account
+    confluent iam rbac role-binding create \
+      --principal User:cncb-producer \
+      --role DeveloperWrite \
+      --resource Topic:cncb.core.v1.account-transaction \
+      --kafka-cluster-id $KAFKA_CLUSTER_ID
+    ```
+
+    The `reference/ansible-roles` playbooks handle role binding creation as part of the topic provisioning tasks. See [Ansible roles reference](/reference/ansible-roles) for the full task list.
+  </Tab>
+</Tabs>
+
+## Related guides
+
+- [Onboard a new Kafka topic](/governance/topic-onboarding) — full self-service workflow including service account declaration
+- [Credential rotation runbook](/operations/credential-rotation) — rotating Kafka API keys and KMS credentials without downtime
+- [Compliance guide](/compliance/compliance-guide) — OFAC/AML audit log requirements and confidential topic data handling policy

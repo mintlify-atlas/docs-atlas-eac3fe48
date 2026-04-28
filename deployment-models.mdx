@@ -1,0 +1,70 @@
+---
+title: "Deployment models: eight scenarios for any infrastructure"
+description: "Compare all eight deployment scenarios — Confluent Cloud, CFK on OpenShift, CP on RHEL, Private Cloud, and LinuxONE — and choose the right model."
+---
+
+The FSI Data Streaming Platform ships as eight self-contained scenarios, each targeting a distinct infrastructure topology. Whether you run on managed Confluent Cloud, container-native OpenShift, bare-metal RHEL, or IBM LinuxONE mainframes, there is a scenario that matches your environment and tooling. Every scenario is governed by the same shared modules and Ansible roles, so topic naming, schema compatibility rules, RBAC patterns, and SLA-tier defaults are identical across all eight — the only thing that differs is the infrastructure automation layer.
+
+## All eight scenarios
+
+| Scenario | Path | Tooling | Use case |
+|---|---|---|---|
+| Confluent Cloud — AWS | `scenarios/cc-aws/` | Terraform | Managed Kafka on AWS with PrivateLink, IAM auth, and S3-backed Terraform state |
+| Confluent Cloud — Azure | `scenarios/cc-azure/` | Terraform | Managed Kafka on Azure with Private Endpoint, Entra ID, and Azure Blob state |
+| Confluent Cloud — GCP | `scenarios/cc-gcp/` | Terraform | Managed Kafka on GCP with Private Service Connect and GCS-backed Terraform state |
+| CFK on OpenShift | `scenarios/cfk-openshift/` | Helm / CFK Operator | Container-native Kafka on OpenShift 4.14–4.21 with cert-manager and MirrorMaker 2 DR |
+| CP on RHEL | `scenarios/cp-rhel/` | Ansible / systemd | Confluent Platform on bare-metal or VM RHEL 8/9 with MDS RBAC and systemd management |
+| Private Cloud | `scenarios/private-cloud/` | Terraform | Governed topic management on a self-hosted Confluent Platform cluster via Kafka REST Proxy |
+| CP on RHEL on LinuxONE | `scenarios/cp-rhel-linuxone/` | Ansible / systemd | Confluent Platform on IBM LinuxONE (s390x) with CPACF crypto acceleration and FIPS support |
+| CFK on OpenShift on LinuxONE | `scenarios/cfk-openshift-linuxone/` | Helm / CFK Operator | CFK on OpenShift running on IBM LinuxONE s390x with node affinity and multi-arch images |
+
+## Scenario categories
+
+<CardGroup cols={3}>
+  <Card title="Confluent Cloud" icon="cloud" href="/deployment/confluent-cloud">
+    Three Terraform scenarios for AWS, Azure, and GCP. Confluent manages the brokers; you supply API keys and cloud networking (PrivateLink, Private Endpoint, or Private Service Connect). Terraform provisions topics, schemas, RBAC, and DR mirror topics via Cluster Linking.
+  </Card>
+  <Card title="Kubernetes (CFK)" icon="layer-group" href="/deployment/cfk-openshift">
+    Two Helm/CFK Operator scenarios for OpenShift — standard x86 and IBM LinuxONE s390x. The CFK operator manages Kafka, Schema Registry, and Connect as Kubernetes custom resources. Topics are declared as `KafkaTopic` CRDs and reconciled continuously by the operator.
+  </Card>
+  <Card title="On-premises (CP/RHEL)" icon="server" href="/deployment/cp-rhel">
+    Three Ansible scenarios for bare-metal RHEL, Private Cloud, and LinuxONE. The `cp-ansible` collection deploys Confluent Platform with systemd management, MDS RBAC, and mTLS. The `site.yml` orchestration pipeline applies full governance in one run.
+  </Card>
+</CardGroup>
+
+## Governance parity across all scenarios
+
+All eight scenarios enforce the same governance rules because they share the same underlying modules and roles:
+
+- **Topic naming** — The `fsi_governance` Jinja2 filter plugin enforces `{domain}.{application}.{version}.{entity}` naming across Terraform locals, CFK KafkaTopic CRDs, and CPTopic YAML files.
+- **Schema compatibility** — The `modules/topic/` Terraform module and `cp_schema` Ansible role both derive compatibility mode from SLA tier: `FULL_TRANSITIVE` for critical, `FULL` for standard, `BACKWARD` for best-effort, and `NONE` for compliance tier.
+- **RBAC** — Producer accounts get `DeveloperWrite` (CC) or ACL `WRITE` (CFK/CP); consumer accounts get `DeveloperRead` or ACL `READ`. MDS RBAC is available for CC and CP scenarios; CFK supports both ACL and MDS modes.
+- **SLA-tier defaults** — Partitions, retention, replication factor, and DR thresholds are all derived from the SLA tier declaration. No manual configuration is required for standard deployments.
+- **CI validation** — The `c4e-precheck.py` script validates all three topic declaration formats (Terraform HCL, KafkaTopic YAML, CPTopic YAML) in every PR, flagging naming violations, missing governance labels, and compatibility overrides before human review.
+
+<Tip>
+The Private Cloud scenario (`scenarios/private-cloud/`) uses the same `modules/topic/` Terraform module as the Confluent Cloud scenarios, just pointed at a self-hosted cluster's Kafka REST endpoint. Governance is identical; only the provider backend differs.
+</Tip>
+
+## Which model should I choose?
+
+<AccordionGroup>
+  <Accordion title="I want Confluent to manage the brokers (no infrastructure ops)">
+    Choose one of the three **Confluent Cloud** scenarios (`cc-aws/`, `cc-azure/`, `cc-gcp/`) matching your cloud provider. Confluent manages broker lifecycle, patching, and scaling. Your team only manages topic declarations and Terraform state. Requires a Confluent Cloud organization, a dedicated or enterprise Kafka cluster, and cloud networking (PrivateLink/Private Endpoint/PSC) configured.
+  </Accordion>
+  <Accordion title="I run on Kubernetes / OpenShift">
+    Choose **CFK on OpenShift** (`cfk-openshift/`) for x86 clusters or **CFK on OpenShift on LinuxONE** (`cfk-openshift-linuxone/`) for IBM s390x. The CFK operator provides a Kubernetes-native operational model: all cluster state is declared as CRDs and continuously reconciled. Requires OpenShift 4.14+ and cert-manager. Topics must go through KafkaTopic CRDs — manual CLI changes will be reverted by the reconciliation loop.
+  </Accordion>
+  <Accordion title="I run on bare-metal or VM RHEL (no Kubernetes)">
+    Choose **CP on RHEL** (`cp-rhel/`) for standard x86 RHEL hosts. The `cp-ansible` collection deploys and manages all Confluent Platform components with systemd. Requires RHEL 8 or 9, Java 17, and SSH access from the Ansible control node to all target hosts. Supports MDS RBAC with LDAP/AD backend and FIPS 140-2 mode.
+  </Accordion>
+  <Accordion title="I have an existing self-managed Confluent Platform cluster">
+    Choose **Private Cloud** (`private-cloud/`) to layer governed topic management on top of a pre-existing Confluent Platform cluster. Uses the Confluent Terraform provider's `kafka_rest_endpoint` mode to manage topics, schemas, and RBAC via the Kafka REST Proxy — no broker deployment required. Requires a running CP cluster with REST Proxy or MDS endpoint accessible from the Terraform runner.
+  </Accordion>
+  <Accordion title="I run on IBM LinuxONE (s390x)">
+    Choose **CP on RHEL on LinuxONE** (`cp-rhel-linuxone/`) for Ansible-managed bare-metal s390x deployments, or **CFK on OpenShift on LinuxONE** (`cfk-openshift-linuxone/`) for container-native s390x. Both scenarios include LinuxONE-specific configuration: IBM Semeru 17 JDK, CPACF crypto acceleration, PKCS12 keystore flags for cross-platform FIPS compatibility, and node affinity rules for mixed-arch OpenShift clusters. See [LinuxONE deployment](/deployment/linuxone) for hardware-backed key storage via CEX cards.
+  </Accordion>
+  <Accordion title="I need RPO=0 for compliance-tier topics">
+    All scenarios support DR, but the DR backend varies by deployment model. **Multi-Region Cluster (MRC)** provides RPO=0 via synchronous replication and is available in CP on RHEL and Private Cloud scenarios. **Cluster Linking** provides near-zero RPO (bounded by mirror lag, typically seconds) for Confluent Cloud scenarios. **MirrorMaker 2** provides asynchronous replication for CFK on OpenShift. Declare topics at `sla_tier = "compliance"` and configure `FSI_DR_BACKEND=mrc` in `.env` to enable the MRC backend. See the [DR runbook](/operations/dr-runbook) for failover procedures.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,588 @@
+---
+title: "Disaster recovery: failover, failback, and DR drills"
+description: "Operational runbook for Cluster Linking, MirrorMaker 2, and Multi-Region Cluster failover and failback across FSI Kafka deployments."
+---
+
+The FSI Kafka Platform supports three DR backends across its deployment models: **Cluster Linking** for Confluent Cloud, **MirrorMaker 2** for CFK on OpenShift and Confluent Platform on RHEL, and **Multi-Region Cluster** for Confluent Platform deployments requiring RPO=0. All three are orchestrated through a single CLI — `fsi-dr.sh` — which automates the otherwise manual multi-step procedures documented here. Service discovery is handled by Consul KV (`fsi/kafka/active-region`), which atomically redirects Kafka bootstrap, Schema Registry, and Oracle JDBC endpoints on failover. This runbook is the authoritative reference for on-call engineers during DR events.
+
+## SLA tier RPO/RTO targets
+
+| SLA tier | RPO target | RTO target | Mirror lag warn | Mirror lag alert | Priority |
+|---|---|---|---|---|---|
+| `critical` | < 5 min | < 15 min | 30 s | 60 s | P1 — immediate |
+| `compliance` | RPO = 0 | < 15 min | 10 s | 30 s | P1 — immediate |
+| `standard` | < 2 hours | < 1 hour | 5 min | 15 min | P2 — business hours |
+| `best-effort` | < 24 hours | < 4 hours | 1 hour | 4 hours | P3 — next business day |
+
+During a multi-topic outage, prioritize failover verification in tier order: `compliance` and `critical` first, then `standard`, then `best-effort`.
+
+## Environment variables
+
+### Common variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FSI_DR_ENV_ID` | Yes | — | Production (East) environment ID |
+| `FSI_DR_CLUSTER_ID` | Yes | — | Production (East) cluster ID |
+| `FSI_DR_DR_ENV_ID` | Yes | — | DR (West) environment ID |
+| `FSI_DR_DR_CLUSTER_ID` | Yes | — | DR (West) cluster ID |
+| `FSI_CONNECT_URL` | No | `http://localhost:8083` | Kafka Connect REST endpoint |
+| `CONSUL_HTTP_ADDR` | No | `http://localhost:8500` | Consul HTTP address |
+| `FSI_CLUSTER_LINK_NAME` | No | `cluster_link_bidir_east_west` | Cluster link name (CL backend) |
+| `FSI_DR_STATE_FILE` | No | `/tmp/fsi-dr-state.json` | State file path |
+| `FSI_DR_BACKEND` | No | `cluster-linking` | DR backend: `cluster-linking`, `mm2`, or `mrc` |
+| `FSI_DR_SYNC_TIMEOUT` | No | `300` | Failback sync wait timeout (seconds) |
+
+### MM2 backend variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `FSI_MM2_CONNECT_URL` | `FSI_CONNECT_URL` | Connect REST API for MM2 dedicated cluster |
+| `FSI_MM2_SOURCE_CONNECTOR` | `mm2-source-east-west` | MirrorSourceConnector name |
+| `FSI_MM2_CHECKPOINT_CONNECTOR` | `mm2-checkpoint-east-west` | MirrorCheckpointConnector name |
+| `FSI_MM2_HEARTBEAT_CONNECTOR` | `mm2-heartbeat-east-west` | MirrorHeartbeatConnector name |
+| `FSI_MM2_SOURCE_ALIAS` | `east` | Source cluster alias |
+| `FSI_MM2_TARGET_ALIAS` | `west` | Target cluster alias |
+
+### MRC backend variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `FSI_MRC_BOOTSTRAP` | `localhost:9092` | MRC cluster bootstrap servers |
+| `FSI_MRC_EAST_RACK` | `us-east` | Rack ID for East (primary) DC |
+| `FSI_MRC_WEST_RACK` | `us-west` | Rack ID for West (DR) DC |
+| `FSI_MRC_OBSERVER_RACK` | `us-central` | Rack ID for observer (light) DC |
+| `FSI_MRC_COMMAND_CONFIG` | (empty) | Path to command config properties for auth |
+
+## Pre-flight verification
+
+Before any DR operation, confirm your environment is healthy:
+
+```bash
+# Verify CLI authentication
+confluent environment list
+
+# Verify cluster access
+confluent kafka cluster describe $FSI_DR_CLUSTER_ID --environment $FSI_DR_ENV_ID
+
+# Verify Consul connectivity
+consul kv get fsi/kafka/active-region
+
+# Verify Connect API
+curl -s $FSI_CONNECT_URL/connectors
+
+# Full pre-flight check
+fsi-dr.sh status
+```
+
+## Failover and failback procedures
+
+<Tabs>
+  <Tab title="Cluster Linking (CC)">
+
+Cluster Linking is the default backend for Confluent Cloud deployments. Failover executes 6 steps in sequence. Before triggering failover, confirm the East region is truly unavailable (not a transient network issue) and that the on-call lead has approved DR activation.
+
+### Failover
+
+<Steps>
+  <Step title="Pause connectors">
+    The CLI snapshots all connector states, then pauses every `RUNNING` connector via the Connect REST API. Intentionally-paused connectors are tracked but not touched.
+
+    ```bash
+    # Automated (single command)
+    fsi-dr.sh failover --dry-run   # preview first
+    fsi-dr.sh failover
+
+    # Manual fallback if CLI unavailable
+    curl -s -X PUT ${FSI_CONNECT_URL}/connectors/<name>/pause
+    ```
+
+    **Success:** All targeted connectors report `state=PAUSED`.
+    **Abort:** Connect REST API unreachable after retries. System is unmodified — safe to abort.
+  </Step>
+
+  <Step title="Promote mirror topics">
+    All active mirror topics on the West cluster are promoted using `confluent kafka mirror failover`. After promotion, West topics become read-write.
+
+    ```bash
+    confluent kafka mirror failover <topics> \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_DR_CLUSTER_ID \
+      --environment $FSI_DR_DR_ENV_ID \
+      -o json
+    ```
+
+    **Success:** All mirror topics report `status=STOPPED` (promoted, R/W on West).
+    **Abort:** No active mirrors found. Check cluster link health:
+    ```bash
+    confluent kafka mirror list \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_DR_CLUSTER_ID \
+      --environment $FSI_DR_DR_ENV_ID
+    ```
+
+    <Warning>
+      Use `mirror failover` (emergency promotion), not `mirror promote` (planned migration). These commands have different semantics. Once promoted, mirror topics cannot be un-promoted — recovery requires the full failback procedure.
+    </Warning>
+  </Step>
+
+  <Step title="Flip Consul to West">
+    Updates Consul KV key `fsi/kafka/active-region` from `east` to `west`, atomically redirecting all Consul-resolved endpoints.
+
+    ```bash
+    # Automated
+    # (executed by fsi-dr.sh failover as step 3)
+
+    # Manual fallback
+    consul kv put fsi/kafka/active-region west
+
+    # Rollback if needed
+    consul kv put fsi/kafka/active-region east
+    ```
+
+    **Success:** `consul kv get fsi/kafka/active-region` returns `west`.
+  </Step>
+
+  <Step title="Verify endpoint resolution">
+    Verifies DNS resolves Kafka, Schema Registry, and Oracle endpoints to West IPs. Retries up to 10 times with 3-second intervals to handle propagation delay.
+
+    ```bash
+    dig +short kafka.fsi.internal
+    dig +short schema.fsi.internal
+    dig +short oracle.fsi.internal
+    ```
+
+    **Success:** All three FQDNs return West IPs.
+    **Abort:** DNS not updating after 30 seconds. Check Consul DNS health, DNS TTL, and Consul agent status.
+  </Step>
+
+  <Step title="Resume connectors">
+    Resumes only connectors that were `RUNNING` before Step 1 (from the state file snapshot). Intentionally-paused connectors remain paused.
+
+    ```bash
+    # Manual fallback if needed
+    curl -s -X PUT ${FSI_CONNECT_URL}/connectors/<name>/resume
+    ```
+
+    **Success:** Previously-RUNNING connectors report `state=RUNNING`.
+    **Note:** Failover is functionally complete at this point even if connector issues arise.
+  </Step>
+
+  <Step title="Final validation">
+    Verifies the West cluster is serving traffic: cluster accessible, mirrors promoted (no active mirrors remaining), connectors running. This step is informational — failover is complete.
+
+    ```bash
+    fsi-dr.sh status
+    ```
+  </Step>
+</Steps>
+
+### Failback
+
+<Warning>
+  Failback is a planned operation, not an emergency. It involves a destructive operation at Step 3 (truncate-and-restore) that permanently truncates East topic data. Always run in a scheduled change window with on-call lead approval. Never attempt failback to an unstable or intermittently available cluster.
+</Warning>
+
+Failback executes 8 steps. There are two operator confirmation gates at Steps 3 and 5.
+
+<Steps>
+  <Step title="Verify East cluster">
+    Confirms the East production cluster is reachable and healthy. Failback cannot proceed if East is down.
+
+    ```bash
+    confluent kafka cluster describe $FSI_DR_CLUSTER_ID --environment $FSI_DR_ENV_ID
+    ```
+  </Step>
+
+  <Step title="Pause connectors on West">
+    Snapshots and pauses all `RUNNING` connectors on West to prevent writes during sync.
+
+    ```bash
+    # Manual fallback
+    ./scripts/connect-pause-all.sh pause
+    ```
+  </Step>
+
+  <Step title="Truncate and restore (destructive)">
+    <Warning>
+      This step permanently truncates East topic data and reconfigures East topics as mirrors from West. **Data on East is destroyed.** Obtain explicit confirmation before proceeding. The automated CLI prompts for confirmation; use `--force` only in CI/automation contexts.
+    </Warning>
+
+    ```bash
+    confluent kafka mirror truncate-and-restore <topics> \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_CLUSTER_ID \
+      --environment $FSI_DR_ENV_ID \
+      -o json
+    ```
+
+    **Success:** East topics show `ACTIVE` mirror status.
+    **If partial failure:** Some East topics may be truncated but not yet mirroring. Check status:
+    ```bash
+    confluent kafka mirror list \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_CLUSTER_ID \
+      --environment $FSI_DR_ENV_ID
+    ```
+  </Step>
+
+  <Step title="Wait for sync">
+    Polls mirror lag on East until all topics reach near-zero lag. Default timeout: 300 seconds. Configure via `FSI_DR_SYNC_TIMEOUT`.
+
+    ```bash
+    fsi-dr.sh status  # monitor progress
+    ```
+  </Step>
+
+  <Step title="Reverse and start">
+    Reverses mirror direction: East becomes read-write (primary) and West becomes mirrors of East.
+
+    ```bash
+    confluent kafka mirror reverse-and-start <topics> \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_CLUSTER_ID \
+      --environment $FSI_DR_ENV_ID
+    ```
+
+    **Success:** East topics are R/W; West topics become mirrors of East.
+  </Step>
+
+  <Step title="Flip Consul to East">
+    ```bash
+    consul kv put fsi/kafka/active-region east
+    ```
+
+    **Success:** `consul kv get fsi/kafka/active-region` returns `east`.
+  </Step>
+
+  <Step title="Resume connectors">
+    Resumes connectors that were `RUNNING` before Step 2.
+
+    ```bash
+    curl -s -X PUT ${FSI_CONNECT_URL}/connectors/<name>/resume
+    ```
+  </Step>
+
+  <Step title="Final validation">
+    ```bash
+    fsi-dr.sh status
+    ```
+
+    Verify East is accessible, Consul points to `east`, and connectors are running.
+  </Step>
+</Steps>
+
+### Quick reference — Cluster Linking
+
+| Action | Command |
+|---|---|
+| Check DR status | `fsi-dr.sh status` |
+| Preview failover | `fsi-dr.sh failover --dry-run` |
+| Execute failover | `fsi-dr.sh failover` |
+| Execute failover (CI) | `fsi-dr.sh failover --force` |
+| Preview failback | `fsi-dr.sh failback --dry-run` |
+| Execute failback | `fsi-dr.sh failback` |
+| Execute failback (CI) | `fsi-dr.sh failback --force` |
+
+  </Tab>
+
+  <Tab title="MirrorMaker 2 (CFK/CP)">
+
+MirrorMaker 2 is the DR backend for CFK on OpenShift and Confluent Platform on RHEL. MM2 replicates via Kafka Connect connectors (MirrorSourceConnector, MirrorCheckpointConnector, MirrorHeartbeatConnector). Because MM2 replicated topics are standard writable Kafka topics on the DR cluster, **no mirror promotion is needed during failover** — pausing the MM2 connectors is sufficient.
+
+MM2 uses prefix-based topic naming: `east.{original-topic}` on the DR cluster.
+
+### Backend comparison
+
+| Aspect | Cluster Linking | MirrorMaker 2 |
+|---|---|---|
+| Replication mechanism | Cluster link (broker-level) | Kafka Connect connectors |
+| Mirror promotion required | Yes | No — topics already writable |
+| Topic naming on DR | Same as source | Prefixed: `east.{name}` |
+| Failover speed | ~5 min (6 steps) | ~3 min |
+| Consumer offset handling | Automatic | Requires MirrorCheckpointConnector translation |
+| CLI dependency | `confluent` CLI required | No `confluent` CLI needed |
+
+### Failover
+
+```bash
+# Dry run
+FSI_DR_BACKEND=mm2 fsi-dr.sh failover --dry-run
+
+# Execute
+FSI_DR_BACKEND=mm2 fsi-dr.sh failover
+
+# Force (CI/automation)
+FSI_DR_BACKEND=mm2 fsi-dr.sh failover --force
+```
+
+**Manual fallback if CLI unavailable:**
+
+```bash
+# Pause all three MM2 connectors
+curl -s -X PUT $FSI_MM2_CONNECT_URL/connectors/mm2-source-east-west/pause
+curl -s -X PUT $FSI_MM2_CONNECT_URL/connectors/mm2-checkpoint-east-west/pause
+curl -s -X PUT $FSI_MM2_CONNECT_URL/connectors/mm2-heartbeat-east-west/pause
+
+# Flip Consul
+consul kv put fsi/kafka/active-region west
+```
+
+<Note>
+  DR consumers read from prefixed topics (e.g., `east.corebanking.transactions.v1.account-transaction`). Use MirrorCheckpointConnector offset translation for consumer group offset migration. Translated offsets are written to the `east.checkpoints.internal` topic and can be looked up via the `RemoteClusterUtils` API.
+</Note>
+
+### Failback
+
+```bash
+# Dry run
+FSI_DR_BACKEND=mm2 fsi-dr.sh failback --dry-run
+
+# Execute
+FSI_DR_BACKEND=mm2 fsi-dr.sh failback
+```
+
+Failback deletes the existing `east->west` MM2 connectors, creates reversed `west->east` connectors, waits for lag to reach near-zero, then stops the reversed connectors, flips Consul back to East, and recreates the original `east->west` connectors.
+
+**Manual fallback:**
+
+```bash
+# Step 1: Delete existing MM2 connectors
+curl -s -X DELETE $FSI_MM2_CONNECT_URL/connectors/mm2-source-east-west
+curl -s -X DELETE $FSI_MM2_CONNECT_URL/connectors/mm2-checkpoint-east-west
+curl -s -X DELETE $FSI_MM2_CONNECT_URL/connectors/mm2-heartbeat-east-west
+
+# Step 2: Create reversed connector (west->east)
+curl -s -X POST $FSI_MM2_CONNECT_URL/connectors \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mm2-source-west-east","config":{
+    "connector.class":"org.apache.kafka.connect.mirror.MirrorSourceConnector",
+    "source.cluster.alias":"west","target.cluster.alias":"east",
+    "source.cluster.bootstrap.servers":"<west-bootstrap>",
+    "target.cluster.bootstrap.servers":"<east-bootstrap>",
+    "topics":".*","replication.factor":"3"}}'
+
+# Step 3: After lag is near-zero, flip Consul back
+consul kv put fsi/kafka/active-region east
+
+# Step 4: Recreate original east->west connectors
+```
+
+### Quick reference — MirrorMaker 2
+
+| Action | Command |
+|---|---|
+| MM2 status | `FSI_DR_BACKEND=mm2 fsi-dr.sh status` |
+| MM2 failover | `FSI_DR_BACKEND=mm2 fsi-dr.sh failover` |
+| MM2 failover (dry-run) | `FSI_DR_BACKEND=mm2 fsi-dr.sh failover --dry-run` |
+| MM2 failover (CI) | `FSI_DR_BACKEND=mm2 fsi-dr.sh failover --force` |
+| MM2 failback | `FSI_DR_BACKEND=mm2 fsi-dr.sh failback` |
+| MM2 failback (dry-run) | `FSI_DR_BACKEND=mm2 fsi-dr.sh failback --dry-run` |
+| MM2 failback (CI) | `FSI_DR_BACKEND=mm2 fsi-dr.sh failback --force` |
+
+  </Tab>
+
+  <Tab title="Multi-Region Cluster (MRC)">
+
+MRC uses Confluent Platform's replica placement v2 with synchronous replication across two full data centers and a third observer DC (2.5-cluster pattern), achieving RPO=0.
+
+### Architecture
+
+- **East DC (primary):** 2 replicas per partition — full read/write
+- **West DC (DR):** 2 replicas per partition — full read/write
+- **Central DC (observer):** 1 observer replica — async, auto-promotes on ISR loss
+- **Replication factor:** 5 (2 East + 2 West + 1 observer)
+- **`min.insync.replicas`:** 3 (forces cross-DC sync for RPO=0)
+
+With `observerPromotionPolicy: under-min-isr`, observer replicas automatically promote into the ISR when the primary DC fails. Explicit leader election via `kafka-leader-election.sh` moves partition leadership to the surviving DC.
+
+### Failover
+
+```bash
+export FSI_DR_BACKEND=mrc
+export FSI_MRC_BOOTSTRAP=kafka-west-1:9092  # use surviving DC
+
+# Preview
+fsi-dr.sh failover --dry-run
+
+# Execute
+fsi-dr.sh failover
+
+# Verify
+fsi-dr.sh status
+```
+
+### Failback
+
+```bash
+export FSI_DR_BACKEND=mrc
+export FSI_MRC_BOOTSTRAP=kafka-east-1:9092  # primary DC recovered
+
+# Verify primary DC health
+fsi-dr.sh status
+
+# Preview
+fsi-dr.sh failback --dry-run
+
+# Execute
+fsi-dr.sh failback
+```
+
+### MRC troubleshooting
+
+| Symptom | Likely cause | Resolution |
+|---|---|---|
+| `NotEnoughReplicasException` from producers | ISR < `min.insync.replicas` during DC failure | Expected during failover window; observers auto-promote |
+| Leader election has no effect | All replicas already in preferred DC | Normal state; no action needed |
+| Observer not promoting | `observerPromotionPolicy` not set | Verify topic created with replica placement v2 JSON including `observerPromotionPolicy` |
+| Failback fails with "cluster unreachable" | Primary DC not fully recovered | Wait for all brokers to rejoin; verify with `kafka-broker-api-versions.sh` |
+
+  </Tab>
+</Tabs>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Mirror lag increasing">
+    **Check:** `fsi-dr.sh status`
+
+    **Causes:** Network between regions, producer throughput spike, cluster resource constraints.
+
+    **Action:** Monitor the trend for 5–10 minutes. If critical or compliance topics are exceeding their RPO threshold, escalate to cloud ops. If lag is increasing steadily, check cluster metrics for disk, CPU, and network bottlenecks.
+  </Accordion>
+
+  <Accordion title="Connect REST API unreachable">
+    **Check:** `curl -s ${FSI_CONNECT_URL}/connectors`
+
+    **Causes:** Connect worker down, network issue, or Connect cluster overloaded.
+
+    **Action:** Failover and failback can proceed without Connect — the connector pause and resume steps can be skipped. Resume connectors manually after the DR operation completes:
+
+    ```bash
+    curl -s -X PUT ${FSI_CONNECT_URL}/connectors/<name>/resume
+    ```
+  </Accordion>
+
+  <Accordion title="Consul KV updated but DNS stale">
+    **Check:** Compare `dig +short kafka.fsi.internal` with `consul kv get fsi/kafka/active-region`.
+
+    **Causes:** DNS caching, Consul DNS TTL, stale Consul agent.
+
+    **Action:** Wait for TTL expiry (default ~30 seconds) or restart the local DNS cache. Verify Consul agent health:
+
+    ```bash
+    consul members
+    consul info | grep dns
+    ```
+  </Accordion>
+
+  <Accordion title="Partial mirror promotion">
+    **Check:**
+
+    ```bash
+    confluent kafka mirror list \
+      --link ${FSI_CLUSTER_LINK_NAME} \
+      --cluster ${FSI_DR_DR_CLUSTER_ID} \
+      --environment ${FSI_DR_DR_ENV_ID}
+    ```
+
+    **Causes:** CLI timeout, cluster overloaded, network partition.
+
+    **Action:** Identify remaining active mirrors and promote manually:
+
+    ```bash
+    confluent kafka mirror failover <remaining-topics> \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_DR_CLUSTER_ID \
+      --environment $FSI_DR_DR_ENV_ID
+    ```
+  </Accordion>
+
+  <Accordion title="Truncate-and-restore partially failed (failback)">
+    **Check:**
+
+    ```bash
+    confluent kafka mirror list \
+      --link ${FSI_CLUSTER_LINK_NAME} \
+      --cluster ${FSI_DR_CLUSTER_ID} \
+      --environment ${FSI_DR_ENV_ID}
+    ```
+
+    **Causes:** CLI timeout, East cluster instability, network issue during the destructive operation.
+
+    **Action:** Some East topics may be truncated while others are not. Identify truncated-but-not-restored topics and retry:
+
+    ```bash
+    confluent kafka mirror truncate-and-restore <topic-names> \
+      --link $FSI_CLUSTER_LINK_NAME \
+      --cluster $FSI_DR_CLUSTER_ID \
+      --environment $FSI_DR_ENV_ID
+    ```
+
+    Applications remain on West until failback completes. West still has all data.
+  </Accordion>
+
+  <Accordion title="State file corruption">
+    **Check:** `cat /tmp/fsi-dr-state.json | jq .`
+
+    **Causes:** Concurrent DR operations, disk full, process killed mid-write.
+
+    **Action:** The state file tracks progress but is not required for manual completion. Delete and proceed manually:
+
+    ```bash
+    rm -f /tmp/fsi-dr-state.json
+    ```
+
+    Use `fsi-dr.sh status` or the Confluent CLI to determine which steps have completed.
+  </Accordion>
+
+  <Accordion title="MM2 connector in FAILED state">
+    **Check:**
+
+    ```bash
+    curl -s $FSI_MM2_CONNECT_URL/connectors/mm2-source-east-west/status | jq .
+    ```
+
+    **Causes:** Source cluster connectivity lost, insufficient permissions, topic auto-creation disabled on target.
+
+    **Action:** Check task-level errors in connector status, fix the root cause, then restart:
+
+    ```bash
+    curl -s -X POST $FSI_MM2_CONNECT_URL/connectors/mm2-source-east-west/restart
+    ```
+  </Accordion>
+
+  <Accordion title="Offset translation issues after MM2 failover">
+    **Check:** Verify MirrorCheckpointConnector was `RUNNING` before failover.
+
+    **Causes:** MirrorCheckpointConnector was not running (no translated offsets available), or the checkpoint interval was too long (offsets stale).
+
+    **Action:** If the checkpoint connector was running, use `RemoteClusterUtils.translateOffsets()` in the consumer application. If not, consumers must reset offsets to `latest` or a specific timestamp.
+
+    ```bash
+    # Check if checkpoint data exists on DR cluster
+    kafka-console-consumer --bootstrap-server <dr-bootstrap> \
+      --topic east.checkpoints.internal \
+      --from-beginning --max-messages 5
+    ```
+  </Accordion>
+
+  <Accordion title="Failover or failback hangs at confirmation prompt">
+    **Cause:** Running in interactive mode without the `--force` flag.
+
+    **Action:** Type `yes` and press Enter, or kill the process and restart with `--force`:
+
+    ```bash
+    fsi-dr.sh failover --force
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+- [Reference: DR CLI](/reference/dr-cli) — full `fsi-dr.sh` command reference
+- [Governance: SLA tiers](/governance/sla-tiers) — RPO/RTO tier definitions and topic classification
+- [Operations: observability](/operations/observability) — DR readiness dashboard and mirror lag alerting
+- [Deployment: Confluent Cloud](/deployment/confluent-cloud) — Cluster Linking setup
+- [Deployment: CFK on OpenShift](/deployment/cfk-openshift) — MirrorMaker 2 setup
+- [Deployment: CP on RHEL](/deployment/cp-rhel) — MRC setup

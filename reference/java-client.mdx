@@ -1,0 +1,488 @@
+---
+title: "Java client reference: producer, consumer, and DLQ"
+description: "FSI C4E Java Kafka client reference: constructor signatures, idempotent config, Avro/SR serialization, DLQ backoff patterns, and JMX metrics."
+---
+
+The FSI Java client library provides two reference classes — `FsiProducer` and `FsiConsumer` — that encode every C4E-mandatory Kafka configuration in a single `Map<String, String>` constructor. Both classes are `AutoCloseable`, implement idempotent or manual-commit semantics, expose JMX metrics for Dynatrace OneAgent, and route failed messages to a `{topic}.dlq` topic via `FsiDlqHandler`. Copy the classes into your application and adapt the business logic; the transport and governance layer is already correct.
+
+<Tabs>
+  <Tab title="Producer">
+
+## Maven dependency
+
+Add the Confluent repository and the following dependencies to your `pom.xml`:
+
+```xml
+<repositories>
+  <repository>
+    <id>confluent</id>
+    <url>https://packages.confluent.io/maven/</url>
+  </repository>
+</repositories>
+
+<dependencies>
+  <!-- Kafka client -->
+  <dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-clients</artifactId>
+    <version>3.7.0</version>
+  </dependency>
+
+  <!-- Confluent Avro serializer -->
+  <dependency>
+    <groupId>io.confluent</groupId>
+    <artifactId>kafka-avro-serializer</artifactId>
+    <version>7.6.0</version>
+  </dependency>
+
+  <!-- Avro -->
+  <dependency>
+    <groupId>org.apache.avro</groupId>
+    <artifactId>avro</artifactId>
+    <version>1.11.3</version>
+  </dependency>
+
+  <!-- Logging -->
+  <dependency>
+    <groupId>org.slf4j</groupId>
+    <artifactId>slf4j-api</artifactId>
+    <version>2.0.12</version>
+  </dependency>
+  <dependency>
+    <groupId>org.slf4j</groupId>
+    <artifactId>slf4j-simple</artifactId>
+    <version>2.0.12</version>
+  </dependency>
+</dependencies>
+```
+
+## Constructor
+
+`FsiProducer` takes a single `Map<String, String>` config. In production, populate the map from environment variables or HashiCorp Vault at call site.
+
+```java
+/**
+ * Create a producer from the standard FSI configuration pattern.
+ *
+ * @param config Map containing at minimum:
+ *   - bootstrap.servers (kafka.fsi.internal:9092 via Consul DNS)
+ *   - schema.registry.url (schema.fsi.internal via Consul DNS)
+ *   - schema.registry.basic.auth.user.info (API key:secret from Vault)
+ *   - sasl.jaas.config (for CC authentication)
+ *   - topic.name (the fully qualified topic name)
+ */
+public FsiProducer(Map<String, String> config) {
+    this.topicName = config.get("topic.name");
+    if (this.topicName == null || this.topicName.isEmpty()) {
+        throw new IllegalArgumentException("topic.name is required");
+    }
+
+    Properties props = buildProperties(config);
+    this.producer = new KafkaProducer<>(props);
+
+    registerJmxMetrics();
+
+    // DLQ handler for routing failed messages
+    this.dlqHandler = new FsiDlqHandler(config, topicName);
+
+    log.info("FSI Producer initialized for topic: {}", topicName);
+}
+```
+
+## Key configuration properties
+
+The `buildProperties` method enforces the following C4E-mandatory settings. Values cannot be overridden without an approved ADR.
+
+```java
+// ── Idempotence (C4E MANDATORY) ──
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+props.put(ProducerConfig.ACKS_CONFIG, "all");
+props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5); // safe with idempotence
+
+// ── Reliability ──
+props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000); // 2 minutes
+props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000);
+
+// ── Performance ──
+props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "zstd");
+props.put(ProducerConfig.BATCH_SIZE_CONFIG, 32768);        // 32KB batches
+props.put(ProducerConfig.LINGER_MS_CONFIG, 20);            // 20ms linger for batching
+```
+
+## send() — asynchronous
+
+Use `send()` for normal throughput scenarios. The callback routes delivery failures to the DLQ.
+
+```java
+/**
+ * Send a record asynchronously with error handling.
+ * The key should be the natural business key (e.g., account_number, transaction_id).
+ */
+public void send(String key, GenericRecord value) {
+    long startMs = System.currentTimeMillis();
+
+    ProducerRecord<String, GenericRecord> record =
+            new ProducerRecord<>(topicName, key, value);
+
+    producer.send(record, (metadata, exception) -> {
+        long latency = System.currentTimeMillis() - startMs;
+        lastLatencyMs.set(latency);
+
+        if (exception != null) {
+            totalErrors.incrementAndGet();
+            log.error("Failed to produce to {} [key={}]: {}",
+                    topicName, key, exception.getMessage(), exception);
+            // DLQ routing with retry classification
+            if (dlqHandler != null) {
+                byte[] keyBytes = key != null ? key.getBytes(java.nio.charset.StandardCharsets.UTF_8) : null;
+                dlqHandler.sendToDlq(keyBytes, null, exception, 0);
+            }
+        } else {
+            totalSent.incrementAndGet();
+            log.debug("Produced to {}-{} offset={} latency={}ms",
+                    metadata.topic(), metadata.partition(),
+                    metadata.offset(), latency);
+        }
+    });
+}
+```
+
+## sendSync() — blocking
+
+Use `sendSync()` only when the downstream step requires the Kafka offset before proceeding (for example, writing a reconciliation record).
+
+```java
+/**
+ * Send synchronously (blocking). Use sparingly — only when you need the offset
+ * before proceeding (e.g., transaction reconciliation).
+ */
+public RecordMetadata sendSync(String key, GenericRecord value) throws Exception {
+    ProducerRecord<String, GenericRecord> record =
+            new ProducerRecord<>(topicName, key, value);
+
+    long startMs = System.currentTimeMillis();
+    try {
+        RecordMetadata metadata = producer.send(record).get();
+        lastLatencyMs.set(System.currentTimeMillis() - startMs);
+        totalSent.incrementAndGet();
+        return metadata;
+    } catch (Exception e) {
+        totalErrors.incrementAndGet();
+        throw e;
+    }
+}
+```
+
+## Full usage example
+
+```java
+// In production, these come from environment variables / Vault / Spring config
+Map<String, String> config = Map.of(
+    "bootstrap.servers", "kafka.fsi.internal:9092",  // Consul DNS
+    "schema.registry.url", "https://schema.fsi.internal",
+    "schema.registry.basic.auth.user.info", System.getenv("SR_API_KEY") + ":" + System.getenv("SR_API_SECRET"),
+    "sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required " +
+        "username='" + System.getenv("KAFKA_API_KEY") + "' " +
+        "password='" + System.getenv("KAFKA_API_SECRET") + "';",
+    "topic.name", "cncb.core.v1.account-transaction",
+    "client.id", "cncb-producer-example"
+);
+
+// Load the Avro schema
+Schema schema = new Schema.Parser().parse(
+    Files.readString(Path.of("../../schemas/cncb-account-transaction.avsc")));
+
+try (FsiProducer producer = new FsiProducer(config)) {
+
+    GenericRecord txn = new GenericData.Record(schema);
+    txn.put("transaction_id", UUID.randomUUID().toString());
+    txn.put("account_number", "1234567890");
+    txn.put("transaction_type", "DEBIT");
+    txn.put("currency", "USD");
+    txn.put("channel", "POS");
+    txn.put("timestamp", Instant.now().toEpochMilli());
+    txn.put("source_system", "CNCB-CORE");
+
+    // Send with account_number as key (ensures partition affinity)
+    producer.send("1234567890", txn);
+    producer.flush();
+}
+```
+
+  </Tab>
+  <Tab title="Consumer">
+
+## Constructor
+
+`FsiConsumer` accepts a config map and a `BiConsumer<String, GenericRecord>` handler. All business logic lives in the handler; the consumer manages subscription, deserialization, offset commit, and shutdown.
+
+```java
+public FsiConsumer(Map<String, String> config, BiConsumer<String, GenericRecord> handler) {
+    this.topics = Arrays.asList(config.getOrDefault("topics", "").split(","));
+    this.recordHandler = handler;
+
+    if (topics.isEmpty() || topics.get(0).isEmpty()) {
+        throw new IllegalArgumentException("topics is required (comma-separated)");
+    }
+
+    Properties props = buildProperties(config);
+    this.consumer = new KafkaConsumer<>(props);
+
+    registerJmxMetrics(config.getOrDefault("group.id", "unknown"));
+    registerShutdownHook();
+
+    log.info("FSI Consumer initialized for topics: {}", topics);
+}
+```
+
+## Key configuration properties
+
+```java
+// ── Consumer group ──
+String groupId = config.get("group.id");
+if (groupId == null) throw new IllegalArgumentException("group.id is required");
+props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+
+// ── Offset management (C4E MANDATORY: manual commit) ──
+props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+// ── Performance ──
+props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
+props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000);  // 5 min max processing time
+props.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, 1024);
+props.put(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, 500);
+
+// ── Follower fetching (read from nearest replica) ──
+props.put(ConsumerConfig.CLIENT_RACK_CONFIG,
+        config.getOrDefault("client.rack", "us-east-1"));
+```
+
+## Poll loop and wakeup pattern
+
+`start()` blocks until `shutdown()` is called (or the JVM shutdown hook fires). The `WakeupException` catch safely exits the loop.
+
+```java
+/**
+ * Start the consume loop. Blocks until shutdown signal.
+ * Call this from your application's main thread.
+ */
+public void start() {
+    running.set(true);
+    consumer.subscribe(topics);
+    log.info("Consumer subscribed to: {}", topics);
+
+    try {
+        while (running.get()) {
+            ConsumerRecords<String, GenericRecord> records =
+                    consumer.poll(Duration.ofMillis(1000));
+
+            lastPollCount.set(records.count());
+
+            if (records.isEmpty()) continue;
+
+            // Process each record
+            for (ConsumerRecord<String, GenericRecord> record : records) {
+                try {
+                    recordHandler.accept(record.key(), record.value());
+                    totalConsumed.incrementAndGet();
+                } catch (Exception e) {
+                    totalErrors.incrementAndGet();
+                    log.error("Error processing record [topic={}, partition={}, offset={}, key={}]: {}",
+                            record.topic(), record.partition(), record.offset(),
+                            record.key(), e.getMessage(), e);
+                    // Default: log and continue (at-least-once semantics)
+                }
+            }
+
+            // Commit offsets after successful batch processing
+            long commitStart = System.currentTimeMillis();
+            consumer.commitSync(Duration.ofSeconds(10));
+            lastCommitLatencyMs.set(System.currentTimeMillis() - commitStart);
+        }
+    } catch (WakeupException e) {
+        if (running.get()) throw e; // Unexpected wakeup
+        log.info("Consumer wakeup received — shutting down");
+    } finally {
+        log.info("Closing consumer. Total consumed: {}, errors: {}",
+                totalConsumed.get(), totalErrors.get());
+        consumer.close(Duration.ofSeconds(30));
+    }
+}
+
+/**
+ * Signal the consumer to stop. Safe to call from another thread.
+ */
+public void shutdown() {
+    log.info("Shutdown requested");
+    running.set(false);
+    consumer.wakeup();
+}
+```
+
+## Full usage example
+
+```java
+Map<String, String> config = Map.of(
+    "bootstrap.servers", "kafka.fsi.internal:9092",
+    "schema.registry.url", "https://schema.fsi.internal",
+    "schema.registry.basic.auth.user.info",
+        System.getenv("SR_API_KEY") + ":" + System.getenv("SR_API_SECRET"),
+    "sasl.jaas.config",
+        "org.apache.kafka.common.security.plain.PlainLoginModule required " +
+        "username='" + System.getenv("KAFKA_API_KEY") + "' " +
+        "password='" + System.getenv("KAFKA_API_SECRET") + "';",
+    "topics", "cncb.core.v1.account-transaction",
+    "group.id", "sa-cncb-consumer-example",
+    "client.rack", "us-east-1"
+);
+
+// The handler is where your business logic lives
+FsiConsumer consumer = new FsiConsumer(config, (key, record) -> {
+    String txnId = record.get("transaction_id").toString();
+    String type = record.get("transaction_type").toString();
+    String channel = record.get("channel").toString();
+
+    log.info("Processing transaction: id={}, type={}, channel={}, key={}",
+            txnId, type, channel, key);
+
+    // Your business logic here:
+    // - Update account balance
+    // - Trigger downstream processing
+    // - Write to database
+});
+
+// Blocks until SIGTERM or consumer.shutdown() is called
+consumer.start();
+```
+
+  </Tab>
+  <Tab title="DLQ">
+
+## Overview
+
+`FsiDlqHandler` routes failed messages to `{source-topic}.dlq` using a dedicated raw-bytes producer. It classifies errors and applies exponential backoff before committing a message to the DLQ.
+
+```java
+/** Maximum retry attempts before routing to DLQ. */
+public static final int MAX_RETRIES = 3;
+
+/** Base backoff in milliseconds (doubles each retry: 1s, 2s, 4s). */
+public static final long BASE_BACKOFF_MS = 1000;
+
+/** Exception types that should NOT be retried. */
+private static final Set<Class<? extends Exception>> NON_RETRYABLE = new HashSet<>(Arrays.asList(
+        org.apache.kafka.common.errors.SerializationException.class,
+        org.apache.kafka.common.errors.InvalidRecordException.class,
+        org.apache.kafka.common.errors.RecordTooLargeException.class,
+        org.apache.kafka.common.errors.TopicAuthorizationException.class,
+        org.apache.kafka.common.errors.GroupAuthorizationException.class
+));
+```
+
+## Error classification
+
+```java
+/**
+ * Classify an exception into a human-readable error category.
+ *
+ * @param e The exception to classify.
+ * @return One of: SERIALIZATION, AUTH_DENIED, BROKER_TIMEOUT, UNKNOWN.
+ */
+public String classifyError(Exception e) {
+    if (e instanceof org.apache.kafka.common.errors.SerializationException
+            || e instanceof org.apache.kafka.common.errors.InvalidRecordException
+            || e instanceof org.apache.kafka.common.errors.RecordTooLargeException) {
+        return "SERIALIZATION";
+    }
+    if (e instanceof org.apache.kafka.common.errors.TopicAuthorizationException
+            || e instanceof org.apache.kafka.common.errors.GroupAuthorizationException
+            || e instanceof org.apache.kafka.common.errors.ClusterAuthorizationException) {
+        return "AUTH_DENIED";
+    }
+    if (e instanceof org.apache.kafka.common.errors.TimeoutException
+            || e instanceof org.apache.kafka.common.errors.NotLeaderOrFollowerException
+            || e instanceof org.apache.kafka.common.errors.LeaderNotAvailableException) {
+        return "BROKER_TIMEOUT";
+    }
+    return "UNKNOWN";
+}
+```
+
+## DLQ record headers
+
+Every message written to the `.dlq` topic carries the following Kafka headers:
+
+| Header | Content |
+|---|---|
+| `dlq.original.topic` | Source topic name |
+| `dlq.error.type` | `SERIALIZATION`, `AUTH_DENIED`, `BROKER_TIMEOUT`, or `UNKNOWN` |
+| `dlq.error.message` | Exception message, truncated to 1024 bytes |
+| `dlq.timestamp` | ISO-8601 UTC timestamp |
+| `dlq.retry.count` | Number of retry attempts before DLQ routing |
+| `dlq.producer.client.id` | Originating producer `client.id` |
+
+## Backoff calculation
+
+```java
+/**
+ * Calculate exponential backoff delay for a given retry count.
+ *
+ * @param retryCount Current retry attempt (0-based).
+ * @return Backoff duration in milliseconds (1s, 2s, 4s).
+ */
+public long getBackoffMs(int retryCount) {
+    return BASE_BACKOFF_MS * (1L << retryCount);
+}
+```
+
+Retry 0 → 1 000 ms, retry 1 → 2 000 ms, retry 2 → 4 000 ms, then DLQ.
+
+  </Tab>
+</Tabs>
+
+## JMX metrics for Dynatrace
+
+Both `FsiProducer` and `FsiConsumer` register custom MBeans under the `org.fsi.kafka` domain. Configure the Dynatrace JMX extension to scrape these object names.
+
+<AccordionGroup>
+  <Accordion title="Producer MBean — org.fsi.kafka.producer:type=FsiProducer,topic=*">
+
+```java
+public interface FsiProducerMetricsMBean {
+    long getTotalSent();
+    long getTotalErrors();
+    long getLastLatencyMs();
+    long getDlqSent();
+    double getErrorRate();
+}
+```
+
+  </Accordion>
+  <Accordion title="Consumer MBean — org.fsi.kafka.consumer:type=FsiConsumer,group=*">
+
+```java
+public interface FsiConsumerMetricsMBean {
+    long getTotalConsumed();
+    long getTotalErrors();
+    long getLastPollCount();
+    long getLastCommitLatencyMs();
+    double getErrorRate();
+}
+```
+
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+Set `METRICS_RECORDING_LEVEL_CONFIG = "INFO"` on both producer and consumer configs. This activates the built-in `kafka.producer.*` and `kafka.consumer.*` JMX metrics that Dynatrace OneAgent picks up automatically alongside the custom MBeans above.
+</Tip>
+
+## Related pages
+
+- [Governance: schema guide](/governance/schema-guide) — Avro schema evolution and compatibility rules
+- [Governance: topic onboarding](/governance/topic-onboarding) — Request a new topic
+- [Operations: observability](/operations/observability) — Dynatrace JMX extension configuration
+- [Reference: Python client](/reference/python-client)
+- [Reference: .NET client](/reference/dotnet-client)

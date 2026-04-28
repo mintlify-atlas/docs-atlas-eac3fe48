@@ -1,0 +1,489 @@
+---
+title: "Ansible roles reference: all ten automation roles"
+description: "Complete reference for all ten FSI Data Streaming Platform Ansible roles — key variables, example invocations, and tag-isolated site.yml execution patterns."
+---
+
+The FSI Data Streaming Platform ships ten Ansible roles that automate every layer of the deployment and Day-2 operations lifecycle: cluster provisioning, governance resource management, Kafka Connect, observability, certificate management, disaster recovery, and Confluent for Kubernetes. Each role is designed to be idempotent, check-mode aware, and independently executable via `--tags` without triggering unrelated plays. All roles expose an output variable (e.g. `cp_topic_results`, `cp_schema_results`) that downstream orchestration can inspect after the role completes.
+
+## Role summary
+
+| Role | Purpose | Primary tag |
+|---|---|---|
+| `cp_topic` | Create and reconcile Kafka topics via Admin REST v3 | `topics` |
+| `cp_schema` | Register Avro schemas with two-pass safety | `schemas` |
+| `cp_rbac` | Provision and reconcile MDS RBAC bindings | `rbac` |
+| `cp_connect` | Deploy Kafka Connect connectors via REST API | `connectors` |
+| `cp_observability` | Deploy JMX, Prometheus, and Grafana stacks | `observability` |
+| `cp_dr_mm2` | MirrorMaker 2 DR failover and failback | *(standalone)* |
+| `cp_dr_mrc` | MRC observer promotion failover and failback | *(standalone)* |
+| `cfk_operator` | Deploy CFK operator via Helm on OpenShift | `cfk-operator` |
+| `cfk_topic` | Generate and apply KafkaTopic CRDs for CFK | `cfk-topics` |
+| `cp_mtls` | Provision mTLS certificate chain for CP clusters | `mtls` |
+
+## site.yml structure
+
+The top-level `site.yml` playbook chains the full deployment pipeline using disjoint play-level tags. Each play carries a single top-level tag, which prevents tag inheritance from triggering unrelated plays when you run with `--tags`.
+
+```yaml
+# Run the full pipeline
+ansible-playbook site.yml
+
+# Run only governance resources (topics + schemas + RBAC)
+ansible-playbook site.yml --tags governance
+
+# Run only topic creation
+ansible-playbook site.yml --tags topics
+
+# Run only the observability stack
+ansible-playbook site.yml --tags observability
+
+# Deploy CFK operator and topic CRDs
+ansible-playbook site.yml --tags cfk
+
+# Provision mTLS certificates
+ansible-playbook site.yml --tags mtls
+```
+
+### Dry-run and audit commands
+
+All roles support `--check` mode. In check mode, roles perform GET-only operations and report what would change without making any mutations.
+
+```bash
+# Dry-run the full pipeline
+ansible-playbook site.yml --check --diff
+
+# Audit RBAC bindings only
+ansible-playbook site.yml --tags rbac --check
+
+# Audit DR readiness (MM2)
+ansible-playbook site.yml --tags connectors --check
+```
+
+## Roles
+
+<AccordionGroup>
+
+<Accordion title="cp_topic — Kafka topic governance">
+
+**Purpose.** Discovers topic definitions from a directory of `CPTopic` YAML manifests or an inline list, validates each topic against SLA tier governance constants and naming rules, and creates or updates topics via the Confluent Platform Admin REST v3 API. Results are collected into `cp_topic_results` for downstream orchestration.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_admin_rest_url` | `""` | Admin REST v3 base URL |
+| `cp_cluster_id` | `""` | Kafka cluster ID |
+| `cp_admin_rest_token` | `""` | MDS bearer token (choose token or basic auth) |
+| `cp_admin_rest_user` | `""` | Basic auth username |
+| `cp_admin_rest_password` | `""` | Basic auth password |
+| `cp_replication_factor` | `3` | Default replication factor for created topics |
+| `cp_topics_dir` | `""` | Directory path to scan for `*.yml` CPTopic manifests |
+| `cp_topics` | `[]` | Inline list of topic definitions |
+
+**Example task invocation**
+
+```yaml
+- name: Deploy topic governance
+  ansible.builtin.include_role:
+    name: cp_topic
+  vars:
+    cp_admin_rest_url: "https://kafka-broker-1:8090"
+    cp_cluster_id: "{{ kafka_cluster_id }}"
+    cp_admin_rest_token: "{{ mds_token }}"
+    cp_topics_dir: "{{ playbook_dir }}/topics/"
+  tags:
+    - topics
+    - governance
+```
+
+**Output variable.** `cp_topic_results` — map with keys `created`, `updated`, `unchanged`, `deleted`, `failed`, `errors`.
+
+</Accordion>
+
+<Accordion title="cp_schema — Avro schema registration">
+
+**Purpose.** Registers Avro schemas with the Confluent Platform Schema Registry using a two-pass safety model: all schemas are compatibility-checked first, and registration proceeds only if every schema passes. Partial registration states are avoided by failing the entire run if any single schema is incompatible. Supports both directory-based discovery of `.avsc` files and inline schema lists.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_sr_url` | `""` | Schema Registry REST endpoint |
+| `cp_sr_user` | `""` | Basic auth username |
+| `cp_sr_password` | `""` | Basic auth password |
+| `cp_sr_token` | `""` | Bearer token (alternative to basic auth) |
+| `cp_schemas_dir` | `""` | Directory to scan for `*.avsc` files |
+| `cp_schemas` | `[]` | Inline list of schema objects |
+| `cp_schema_metadata_enabled` | `true` | Stamp governance metadata onto subjects |
+| `cp_schema_validate_structural` | `true` | Run structural validation via `validate-schemas.py` before registration |
+| `cp_schema_validate_script` | `"{{ playbook_dir }}/../ci/scripts/validate-schemas.py"` | Path to the Python structural validation script |
+
+**Example task invocation**
+
+```yaml
+- name: Deploy schema governance
+  ansible.builtin.include_role:
+    name: cp_schema
+  vars:
+    cp_sr_url: "https://schema-registry:8081"
+    cp_sr_user: "{{ sr_user }}"
+    cp_sr_password: "{{ sr_password }}"
+    cp_schemas_dir: "{{ playbook_dir }}/../../schemas/"
+  tags:
+    - schemas
+    - governance
+```
+
+**Output variable.** `cp_schema_results` — map with keys `registered`, `unchanged`, `failed`, `errors`.
+
+</Accordion>
+
+<Accordion title="cp_rbac — MDS RBAC binding management">
+
+**Purpose.** Provisions and reconciles Confluent Metadata Service (MDS) RBAC bindings for Kafka topics, consumer groups, and Schema Registry subjects. Acquires an MDS bearer token, creates bindings per topic, and optionally removes stale bindings during reconciliation. Supports check mode for auditing planned changes without mutations.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_mds_url` | `""` | MDS REST API base URL (required) |
+| `cp_mds_username` | `""` | MDS admin username (required) |
+| `cp_mds_password` | `""` | MDS admin password (required) |
+| `cp_kafka_cluster_id` | `""` | Kafka cluster ID for binding scope (required) |
+| `cp_sr_cluster_id` | `"schema-registry"` | Schema Registry cluster ID for subject bindings |
+| `cp_rbac_bindings` | `[]` | List of binding definitions — each with `topic_name`, `producers`, `consumers` |
+| `cp_rbac_reconcile` | `true` | Enable stale binding removal (ARBAC-05) |
+| `cp_rbac_token_refresh_margin` | `60` | Seconds before token expiry to trigger re-authentication |
+
+**Binding definition example**
+
+```yaml
+cp_rbac_bindings:
+  - topic_name: corebanking.transactions.v1.account-transaction
+    producers:
+      - User:sa-corebanking-producer
+    consumers:
+      - User:sa-corebanking-consumer
+      - User:sa-fraud-enrichment
+```
+
+**Example task invocation**
+
+```yaml
+- name: Deploy RBAC governance
+  ansible.builtin.include_role:
+    name: cp_rbac
+  vars:
+    cp_mds_url: "https://kafka-broker-1:8090"
+    cp_mds_username: "{{ mds_admin_user }}"
+    cp_mds_password: "{{ mds_admin_password }}"
+    cp_kafka_cluster_id: "{{ kafka_cluster_id }}"
+    cp_rbac_bindings: "{{ topic_rbac_bindings }}"
+  tags:
+    - rbac
+    - governance
+```
+
+**Output variable.** `cp_rbac_results` — map with keys `created`, `removed`, `unchanged`, `failed`, `errors`.
+
+</Accordion>
+
+<Accordion title="cp_connect — Kafka Connect connector lifecycle">
+
+**Purpose.** Deploys and validates Kafka Connect connectors via the Connect REST API using idempotent PUT operations. After deployment, polls connector status until healthy or retries are exhausted. Supports check mode (GET-only) and fails the play if any connector remains unhealthy after deployment.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_connect_url` | `"http://localhost:8083"` | Connect REST API base URL |
+| `cp_connectors` | `[]` | List of connector definitions: `[{name: "...", config: {...}}, ...]` |
+| `cp_connect_validate_health` | `true` | Poll and validate connector health after deployment |
+| `cp_connect_health_retries` | `5` | Number of health check retries |
+| `cp_connect_health_delay` | `10` | Seconds between health check retries |
+
+**Example task invocation**
+
+```yaml
+- name: Deploy connectors via cp_connect role
+  ansible.builtin.include_role:
+    name: cp_connect
+  vars:
+    cp_connect_url: "https://connect-worker-1:8083"
+    cp_connectors:
+      - name: jdbc-source-oracle-east
+        config:
+          connector.class: io.confluent.connect.jdbc.JdbcSourceConnector
+          connection.url: "{{ oracle_jdbc_url }}"
+          topic.prefix: "cncb.core.v1."
+  tags:
+    - connectors
+```
+
+**Output variable.** `cp_connect_results` — map with keys `created`, `updated`, `failed`, `healthy`, `unhealthy`.
+
+</Accordion>
+
+<Accordion title="cp_observability — JMX, Prometheus, and Grafana">
+
+**Purpose.** Deploys the full observability stack for Confluent Platform clusters: JMX exporter configuration files to target nodes, Prometheus `file_sd_configs` scrape targets generated from the Ansible inventory, Grafana dashboards imported via file provisioning or API, and SLA-tier-aware alert rules. Each component can be enabled or disabled independently via feature flags.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_obs_broker_jmx_port` | `8080` | JMX exporter port for Kafka brokers (cp-ansible default) |
+| `cp_obs_sr_jmx_port` | `8078` | JMX exporter port for Schema Registry |
+| `cp_obs_connect_jmx_port` | `8077` | JMX exporter port for Kafka Connect |
+| `cp_obs_zk_jmx_port` | `8079` | JMX exporter port for ZooKeeper |
+| `cp_obs_jmx_exporter_config_dir` | `"/opt/prometheus/jmx-exporter"` | Target directory for JMX exporter config files |
+| `cp_obs_prometheus_targets_dir` | `"/etc/prometheus/file_sd"` | Directory for Prometheus file_sd target files |
+| `cp_obs_cluster_name` | `"fsi-kafka"` | Cluster name label in Prometheus and Grafana |
+| `cp_obs_environment` | `"prod"` | Environment label |
+| `cp_obs_grafana_url` | `"http://localhost:3000"` | Grafana base URL |
+| `cp_obs_grafana_api_key` | `""` | Grafana API key (API method only) |
+| `cp_obs_grafana_method` | `"file_provisioning"` | Dashboard import method: `file_provisioning` or `api` |
+| `cp_obs_grafana_provisioning_dir` | `"/etc/grafana/provisioning/dashboards"` | Grafana dashboard provisioning directory |
+| `cp_obs_grafana_alert_provisioning_dir` | `"/etc/grafana/provisioning/alerting"` | Grafana alert provisioning directory |
+| `cp_obs_deploy_jmx` | `true` | Enable JMX exporter config deployment |
+| `cp_obs_deploy_prometheus` | `true` | Enable Prometheus target generation |
+| `cp_obs_deploy_grafana` | `true` | Enable Grafana dashboard import |
+| `cp_obs_deploy_alerts` | `true` | Enable alert rule deployment |
+
+**Example task invocation**
+
+```yaml
+- name: Deploy observability via cp_observability role
+  ansible.builtin.include_role:
+    name: cp_observability
+  vars:
+    cp_obs_cluster_name: "fsi-kafka-prod"
+    cp_obs_environment: "prod"
+    cp_obs_grafana_url: "https://grafana.fsi.internal"
+    cp_obs_grafana_api_key: "{{ grafana_api_key }}"
+    cp_obs_grafana_method: "api"
+  tags:
+    - observability
+```
+
+**Output variable.** `cp_observability_results` — map with keys `jmx_deployed`, `prometheus_deployed`, `grafana_deployed`, `alerts_deployed`.
+
+</Accordion>
+
+<Accordion title="cp_dr_mm2 — MirrorMaker 2 DR failover and failback">
+
+**Purpose.** Orchestrates MirrorMaker 2 disaster recovery operations — failover and failback — via the Connect REST API, Consul HTTP API, and Admin REST v3 API. On failover: pauses MM2 connectors, flips the Consul KV key `fsi/kafka/active-region` to the target region, and validates topic writability. On failback: reverses the sequence, recreating reversed connectors and restoring normal replication direction. Includes pre- and post-validation checks and a check-mode audit path.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_dr_mm2_operation` | `failover` | Operation to perform: `failover` or `failback` |
+| `cp_dr_mm2_connect_url` | `"http://localhost:8083"` | Connect REST API URL (MM2 dedicated cluster) |
+| `cp_dr_mm2_source_connector` | `"mm2-source-east-west"` | MM2 source connector name |
+| `cp_dr_mm2_checkpoint_connector` | `"mm2-checkpoint-east-west"` | MM2 checkpoint connector name |
+| `cp_dr_mm2_heartbeat_connector` | `"mm2-heartbeat-east-west"` | MM2 heartbeat connector name |
+| `cp_dr_mm2_source_alias` | `"east"` | Source cluster alias |
+| `cp_dr_mm2_target_alias` | `"west"` | Target cluster alias |
+| `cp_dr_mm2_consul_url` | `"http://localhost:8500"` | Consul HTTP API URL |
+| `cp_dr_mm2_consul_kv_key` | `"fsi/kafka/active-region"` | Consul KV key that stores the active region |
+| `cp_dr_mm2_target_region` | `"west"` | Region value written to Consul on failover |
+| `cp_dr_mm2_admin_rest_url` | `""` | Admin REST v3 URL for writability validation |
+| `cp_dr_mm2_cluster_id` | `""` | Kafka cluster ID for Admin REST |
+| `cp_dr_mm2_app_connect_url` | `"http://localhost:8083"` | Connect REST URL for business connectors (may differ from MM2 cluster) |
+| `cp_dr_mm2_validate_health` | `true` | Enable connector health validation |
+| `cp_dr_mm2_validate_writability` | `true` | Enable topic writability validation |
+
+**Example invocation — failover**
+
+```bash
+ansible-playbook site.yml \
+  -e cp_dr_mm2_operation=failover \
+  -e cp_dr_mm2_target_region=west \
+  --tags connectors
+```
+
+**Example invocation — dry-run audit**
+
+```bash
+ansible-playbook site.yml --tags connectors --check
+```
+
+**Output variable.** `cp_dr_mm2_results` — map with keys `operation`, `connectors_paused`, `connectors_resumed`, `connectors_deleted`, `connectors_created`, `consul_flipped`, `validation_passed`, `audit_log`.
+
+</Accordion>
+
+<Accordion title="cp_dr_mrc — MRC observer promotion DR">
+
+**Purpose.** Manages Multi-Region Clusters (MRC) observer promotion for disaster recovery using `kafka-leader-election.sh`. On failover, triggers an UNCLEAN leader election to promote observer replicas to leaders, then flips the Consul KV key to redirect application traffic. On failback, triggers a PREFERRED election to rebalance leadership back to the primary rack. Includes pre- and post-validation of observer ISR state and topic writability.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_dr_mrc_operation` | `failover` | Operation to perform: `failover` or `failback` |
+| `cp_dr_mrc_bootstrap` | `"localhost:9092"` | Kafka bootstrap server for CLI tools |
+| `cp_dr_mrc_command_config` | `""` | Path to command config file for Confluent CLI authentication |
+| `cp_dr_mrc_east_rack` | `"us-east"` | Rack ID for the East (primary) region |
+| `cp_dr_mrc_west_rack` | `"us-west"` | Rack ID for the West (DR) region |
+| `cp_dr_mrc_observer_rack` | `"us-central"` | Rack ID for the observer region |
+| `cp_dr_mrc_target_region` | `"west"` | Region value written to Consul on failover |
+| `cp_dr_mrc_consul_url` | `"http://localhost:8500"` | Consul HTTP API URL |
+| `cp_dr_mrc_consul_kv_key` | `"fsi/kafka/active-region"` | Consul KV key that stores the active region |
+| `cp_dr_mrc_admin_rest_url` | `""` | Admin REST v3 URL for writability validation |
+| `cp_dr_mrc_validate_observers` | `true` | Validate observer ISR state before failover |
+| `cp_dr_mrc_validate_writability` | `true` | Validate topic writability after election |
+| `cp_dr_mrc_election_json_dir` | `"/tmp"` | Directory for generated leader election JSON |
+| `cp_dr_mrc_election_wait_seconds` | `5` | Seconds to wait after election for propagation |
+
+**Example invocation — failover**
+
+```bash
+ansible-playbook site.yml \
+  -e cp_dr_mrc_operation=failover \
+  -e cp_dr_mrc_target_region=west \
+  -e cp_dr_mrc_bootstrap=kafka-broker-1:9092
+```
+
+**Example invocation — dry-run audit**
+
+```bash
+ansible-playbook site.yml --check \
+  -e cp_dr_mrc_operation=failover
+```
+
+**Output variable.** `cp_dr_mrc_results` — map with keys `operation`, `election_type`, `election_triggered`, `consul_flipped`, `validation_passed`, `audit_log`.
+
+</Accordion>
+
+<Accordion title="cfk_operator — CFK operator and platform CRs">
+
+**Purpose.** Deploys the Confluent for Kubernetes operator on OpenShift via Helm from the official Confluent Helm repository, then applies platform custom resources — `KafkaCluster`, `SchemaRegistry`, and `Connect` CRDs — with readiness gates to ensure each component reaches `RUNNING` phase before the next is applied.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cfk_helm_repo_name` | `confluentinc` | Helm repository name |
+| `cfk_helm_repo_url` | `https://packages.confluent.io/helm` | Helm repository URL |
+| `cfk_helm_chart_ref` | `confluentinc/confluent-for-kubernetes` | Helm chart reference |
+| `cfk_helm_chart_version` | `"0.921.2"` | CFK operator Helm chart version |
+| `cfk_helm_release_name` | `confluent-operator` | Helm release name |
+| `cfk_namespace` | `confluent` | Kubernetes/OpenShift namespace |
+| `cfk_helm_wait_timeout` | `"600s"` | Helm install/upgrade wait timeout |
+| `cfk_kafka_cr_path` | `""` | Path to KafkaCluster custom resource YAML |
+| `cfk_schema_registry_cr_path` | `""` | Path to SchemaRegistry custom resource YAML |
+| `cfk_connect_cr_path` | `""` | Path to Connect custom resource YAML |
+| `cfk_readiness_retries` | `30` | Retries for CR readiness polling |
+| `cfk_readiness_delay` | `20` | Seconds between readiness retries |
+| `cfk_cr_wait_timeout` | `600` | Maximum seconds to wait for a CR to reach expected phase |
+| `cfk_expected_status_phase` | `"RUNNING"` | Expected CR status phase before proceeding |
+
+**Example task invocation**
+
+```yaml
+- name: Deploy CFK operator and CRs
+  ansible.builtin.include_role:
+    name: cfk_operator
+  vars:
+    cfk_namespace: confluent
+    cfk_helm_chart_version: "0.921.2"
+    cfk_kafka_cr_path: "{{ playbook_dir }}/crs/kafka-cluster.yml"
+    cfk_schema_registry_cr_path: "{{ playbook_dir }}/crs/schema-registry.yml"
+  tags:
+    - cfk-operator
+    - cfk
+```
+
+</Accordion>
+
+<Accordion title="cfk_topic — KafkaTopic CRD generation for CFK">
+
+**Purpose.** Generates and applies `KafkaTopic` CRDs for Confluent for Kubernetes deployments by consuming the same `CPTopic` YAML manifests used by `cp_topic`. Loads SLA tier governance constants and naming rules, discovers topic definitions from a directory or inline list, and applies the corresponding CRDs to the configured Kubernetes namespace. Supports check mode.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cfk_topic_namespace` | `confluent` | Kubernetes namespace where KafkaTopic CRDs are applied |
+| `cfk_kafka_cluster_name` | `kafka` | CFK Kafka cluster resource name used in `kafkaClusterRef` |
+| `cfk_replication_factor` | `3` | Replication factor for generated KafkaTopic CRDs |
+| `cfk_topics_dir` | `""` | Directory to scan for `*.yml` CPTopic manifests |
+| `cfk_topics` | `[]` | Inline list of CPTopic definitions |
+| `cfk_topic_api_version` | `"platform.confluent.io/v1beta1"` | KafkaTopic CRD API version |
+
+**Example task invocation**
+
+```yaml
+- name: Apply CFK topic governance
+  ansible.builtin.include_role:
+    name: cfk_topic
+  vars:
+    cfk_topic_namespace: confluent
+    cfk_kafka_cluster_name: kafka
+    cfk_topics_dir: "{{ playbook_dir }}/topics/"
+  tags:
+    - cfk-topics
+    - cfk
+```
+
+</Accordion>
+
+<Accordion title="cp_mtls — mTLS certificate chain provisioning">
+
+**Purpose.** Provisions a complete mTLS certificate chain for Confluent Platform clusters across five stages: CA generation on the designated `cert_authority` host, per-broker keystore generation, per-client keystore generation, CA truststore distribution to all hosts, and broker SSL property injection into `server.properties`. Private keys never cross the wire — keystore assembly happens on the target host. An optional PKCS#11/CEX HSM backend is available for IBM LinuxONE deployments.
+
+**Key variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `cp_mtls_ca_dir` | `/etc/pki/kafka-ca` | CA key and certificate directory on the `cert_authority` host |
+| `cp_mtls_ca_common_name` | `FSI-Kafka-Root-CA` | CA certificate common name |
+| `cp_mtls_ca_validity_days` | `3650` | CA certificate validity in days (~10 years) |
+| `cp_mtls_cert_validity_days` | `825` | Leaf certificate validity in days |
+| `cp_mtls_cert_key_size` | `2048` | RSA key size for leaf certificates |
+| `cp_mtls_cert_digest` | `sha256` | Digest algorithm for certificate signing |
+| `cp_mtls_ssl_dir` | `/etc/kafka/ssl` | On-host directory for keystores and truststores |
+| `cp_mtls_ssl_owner` | `cp-kafka` | File owner for SSL directory |
+| `cp_mtls_ssl_group` | `confluent` | File group for SSL directory |
+| `cp_mtls_listener_port` | `9093` | SSL listener port on brokers |
+| `cp_mtls_ssl_enabled_protocols` | `"TLSv1.3,TLSv1.2"` | Enabled TLS protocol versions |
+| `cp_mtls_ssl_protocol` | `"TLSv1.3"` | Preferred TLS protocol |
+| `cp_mtls_ssl_client_auth` | `required` | Mutual TLS client authentication mode |
+| `cp_mtls_ssl_principal_mapping` | `"RULE:^CN=([^,]+).*$/$1/,DEFAULT"` | Principal mapping rule for CN extraction |
+| `cp_mtls_ssl_keystore_type` | `PKCS12` | Keystore format |
+| `cp_mtls_ssl_truststore_type` | `PKCS12` | Truststore format |
+| `cp_mtls_keystore_backend` | `software` | Keystore backend: `software` or `pkcs11` (CEX HSM) |
+| `cp_mtls_ca_passphrase` | `""` | CA key passphrase — set via `group_vars/vault.yml` |
+| `cp_mtls_keystore_password` | `""` | Keystore password — set via `group_vars/vault.yml` |
+| `cp_mtls_truststore_password` | `""` | Truststore password — set via `group_vars/vault.yml` |
+
+**Example task invocation**
+
+```yaml
+- name: Provision mTLS via cp_mtls role
+  ansible.builtin.include_role:
+    name: cp_mtls
+  vars:
+    cp_mtls_ca_common_name: "FSI-Kafka-Root-CA"
+    cp_mtls_ssl_enabled_protocols: "TLSv1.3,TLSv1.2"
+    cp_mtls_keystore_backend: software
+  tags:
+    - mtls
+    - certificates
+```
+
+**Output variable.** `cp_mtls_results` — map with keys `ca_generated`, `broker_certs`, `client_certs`, `truststores`, `ssl_configs`, `failed`, `errors`.
+
+</Accordion>
+
+</AccordionGroup>
+
+## Related pages
+
+- [Confluent Platform on RHEL deployment](/deployment/cp-rhel) — inventory and group_vars setup for the cp_\* roles
+- [CFK on OpenShift deployment](/deployment/cfk-openshift) — prerequisites and namespace configuration for cfk_\* roles
+- [DR runbook](/operations/dr-runbook) — step-by-step procedures that invoke `cp_dr_mm2` and `cp_dr_mrc`
+- [Observability guide](/operations/observability) — dashboard and alert configuration details for `cp_observability`
+- [Security and RBAC](/governance/security-rbac) — governance policy that the `cp_rbac` role enforces
+- [Credential rotation](/operations/credential-rotation) — procedures for rotating the secrets consumed by these roles

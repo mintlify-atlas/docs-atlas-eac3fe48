@@ -1,133 +1,72 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "FSI Data Streaming Platform"
+description: "Turnkey Kafka, Flink, and Schema Registry infrastructure for financial institutions — governed, DR-ready, and FSI-compliant in hours."
 ---
 
-## Setting up
+The FSI Data Streaming Platform is a complete, automation-first infrastructure kit for standing up governed Kafka, Flink, and Schema Registry environments. Pick your deployment model, fill in a configuration file, run one command, and get a production-grade streaming platform that already meets FSI regulatory requirements — topic governance, schema evolution controls, RBAC, encryption, disaster recovery, observability, and audit trails included.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Deploy your first governed topic in under an hour
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Deployment Models" icon="server" href="/deployment-models">
+    Choose from eight scenarios across cloud and on-premises
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Topic Onboarding" icon="layer-group" href="/governance/topic-onboarding">
+    Self-service workflow to onboard a new Kafka topic
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="DR Runbook" icon="shield-halved" href="/operations/dr-runbook">
+    Failover and failback procedures for all three DR backends
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What's included
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Governance as Code" icon="scale-balanced" href="/governance/topic-onboarding">
+    One Terraform module declaration creates the topic, Avro schema, RBAC bindings, DR mirror, and metadata tags automatically.
+  </Card>
+  <Card title="SLA Tiers" icon="chart-bar" href="/governance/sla-tiers">
+    Declare `critical`, `standard`, `best-effort`, or `compliance` — all config defaults are derived automatically from the tier.
+  </Card>
+  <Card title="Three DR Backends" icon="arrows-rotate" href="/operations/dr-runbook">
+    Cluster Linking, MirrorMaker 2, and Multi-Region Cluster behind one unified CLI and Ansible playbooks.
+  </Card>
+  <Card title="Six Observability Providers" icon="chart-line" href="/operations/observability">
+    Import-ready dashboards for Dynatrace, Datadog, Splunk, Grafana, New Relic, and IBM Instana.
+  </Card>
+  <Card title="FSI Compliance" icon="file-shield" href="/compliance/compliance-guide">
+    FIPS 140-2, CSFLE field-level encryption, 7-year retention for OFAC/AML, and a full CI audit trail.
+  </Card>
+  <Card title="Reference Clients" icon="code" href="/reference/java-client">
+    Production-quality client examples in Java 17, Python, and .NET with DLQ patterns and Avro/SR integration.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Platform at a glance
 
-## Make your content agent ready
+| Capability | Details |
+|---|---|
+| Deployment scenarios | 8 (Confluent Cloud AWS/Azure/GCP, CFK on OpenShift, CP on RHEL, Private Cloud, LinuxONE variants) |
+| Governance parity | Identical topic naming, schema compatibility, and RBAC across all scenarios |
+| DR backends | Cluster Linking · MirrorMaker 2 · Multi-Region Cluster (RPO=0) |
+| Observability providers | Dynatrace · Datadog · Splunk · Grafana · New Relic · IBM Instana |
+| Reference languages | Java 17 · Python · .NET |
+| Test coverage | 103 shell DR tests + 662 Ansible role tests |
 
-Make your docs work for humans and AI agents alike.
+## Get started
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Choose your deployment model">
+    Review the [deployment models](/deployment-models) and pick the scenario that matches your infrastructure. Each scenario has its own directory under `scenarios/`.
+  </Step>
+  <Step title="Configure your environment">
+    Copy `.env.example` to `.env` and fill in your cluster credentials and infrastructure references. For Terraform scenarios, also copy `terraform.tfvars.example`.
+  </Step>
+  <Step title="Deploy the platform">
+    Run Terraform, Helm, or Ansible depending on your scenario. See the [quickstart guide](/quickstart) for the exact commands.
+  </Step>
+  <Step title="Onboard your first topic">
+    Follow the [topic onboarding guide](/governance/topic-onboarding) to declare your first governed topic with schema, RBAC, and DR mirror — in under a day.
+  </Step>
+</Steps>

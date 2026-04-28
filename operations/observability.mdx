@@ -1,0 +1,326 @@
+---
+title: "Observability: dashboards, alerts, and JMX metrics"
+description: "Multi-provider observability for the FSI Kafka Platform: dashboards, SLA-tier alert rules, JMX exporter config, and cp_observability Ansible role."
+---
+
+The FSI Kafka Platform ships provider-agnostic observability templates that cover all six supported monitoring platforms. Every dashboard and alert rule set is derived from the same underlying metrics defined in the cross-provider metrics mapping, ensuring that teams running Dynatrace in one environment get the same operational visibility as teams running Grafana in another. For Confluent Cloud deployments, metrics flow through the CC Metrics API Prometheus export endpoint. For CFK on OpenShift and Confluent Platform on RHEL deployments, a JMX exporter agent collects broker, Schema Registry, and Connect metrics from each component's JMX port. Alert thresholds are driven by the SLA tier classification from ADR-008 — the same thresholds used by `fsi-dr.sh` to assess DR readiness.
+
+## Supported observability providers
+
+<CardGroup cols={3}>
+  <Card title="Dynatrace" icon="chart-line" href="/operations/observability#provider-setup">
+    Dashboard, JMX exporter config, and alert definitions. Metrics ingested via Dynatrace API v2 (`metrics.ingest` scope).
+  </Card>
+  <Card title="Datadog" icon="chart-bar" href="/operations/observability#provider-setup">
+    Dashboard and monitor definitions. JMX exporter config for CFK/CP. Metrics via Datadog API.
+  </Card>
+  <Card title="Splunk" icon="search" href="/operations/observability#provider-setup">
+    SPL-based metrics queries and dashboard definitions. Metrics ingested via HTTP Event Collector (HEC).
+  </Card>
+  <Card title="Grafana" icon="activity" href="/operations/observability#grafana-and-prometheus">
+    Five dashboard JSON templates, PromQL alert rules, JMX exporter config, and CC Metrics API datasource config.
+  </Card>
+  <Card title="New Relic" icon="bar-chart-2" href="/operations/observability#provider-setup">
+    NRQL-based dashboards and alert policies. Metrics ingested via New Relic Metrics API.
+  </Card>
+  <Card title="Instana" icon="monitor" href="/operations/observability#provider-setup">
+    Custom dashboard definitions using Instana REST API metrics queries.
+  </Card>
+</CardGroup>
+
+## Dashboard categories
+
+The platform provides four operational dashboard categories across all providers:
+
+| Category | Description | Key metrics |
+|---|---|---|
+| **Cluster health** | Broker connections, under-replicated partitions, request rate, active controller, per-broker partition count | `active_connection_count`, `request_count`, `under_replicated_partitions`, `partition_count` |
+| **Application view** | Consumer group lag (records) with domain prefix auto-discovery, per-partition breakdown, SLA-tier thresholds | `consumer_lag_offsets`, consumer group state |
+| **Connect status** | Connector state (RUNNING/PAUSED/FAILED/UNASSIGNED), task health, auto-discovery via Connect REST API | Connect REST `/connectors`, `/connectors/{name}/status` |
+| **DR readiness** | Mirror lag per topic, cluster link health, failover readiness assessment with SLA-tier thresholds | `cluster_link_mirror_topic_offset_lag`, derived mirror lag in seconds, `cluster_link_state` |
+
+For Grafana, these map to five dashboard files:
+
+| File | Description |
+|---|---|
+| `dashboard-cluster-health.json` | Broker metrics, partition health, controller status |
+| `dashboard-consumer-lag.json` | Consumer group lag by topic with auto-discovery |
+| `dashboard-connect-status.json` | Connector state monitoring via REST API |
+| `dashboard-dr-readiness.json` | Mirror lag and DR health assessment |
+| `dashboard-flink-jobs.json` | Flink job metrics via `io.confluent.flink/*` CC Metrics API |
+
+## SLA-tier alert thresholds
+
+Alert thresholds are derived from ADR-008 and match the `_tier_warn_threshold` / `_tier_alert_threshold` functions in `scripts/fsi-dr.sh`.
+
+### Mirror lag thresholds
+
+| SLA tier | Warn threshold | Alert threshold | DR priority |
+|---|---|---|---|
+| `critical` | 30 s | 60 s | P1 — immediate failover |
+| `compliance` | 10 s | 30 s | P1 — immediate failover |
+| `standard` | 5 min (300 s) | 15 min (900 s) | P2 — business hours |
+| `best-effort` | 1 hour (3600 s) | 4 hours (14400 s) | P3 — next business day |
+
+### Consumer lag thresholds
+
+| SLA tier | Warn (records) | Alert (records) |
+|---|---|---|
+| `critical` | 1,000 | 5,000 |
+| `compliance` | 500 | 2,000 |
+| `standard` | 10,000 | 50,000 |
+| `best-effort` | 100,000 | 500,000 |
+
+### Connect task failure thresholds
+
+| Condition | Threshold | Severity |
+|---|---|---|
+| Any task in FAILED state | ≥ 1 task | Critical (all tiers) |
+| Task restart count | ≥ 3 restarts in 15 min | Warning |
+
+## Cross-provider metrics mapping
+
+The `observability/metrics-mapping.md` file provides query equivalents for each metric across all six providers. Key metrics used in DR readiness dashboards:
+
+| CC Metrics API metric | Description | Grafana (PromQL) |
+|---|---|---|
+| `io.confluent.kafka.server/cluster_link_mirror_topic_offset_lag` | Mirror topic offset lag (records) | `confluent_kafka_server_cluster_link_mirror_topic_offset_lag{kafka_id="$CLUSTER_ID", topic=~"$DOMAIN_PREFIX.*"}` |
+| `io.confluent.kafka.server/consumer_lag_offsets` | Consumer group lag in records | `confluent_kafka_server_consumer_lag_offsets{kafka_id="$CLUSTER_ID", topic=~"$DOMAIN_PREFIX.*"}` |
+| `io.confluent.kafka.server/active_connection_count` | Active broker connections | `confluent_kafka_server_active_connection_count{kafka_id="$CLUSTER_ID"}` |
+| JMX: `kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions` | Under-replicated partitions | `kafka_server_replica_manager_under_replicated_partitions{kafka_id="$CLUSTER_ID"}` |
+
+Mirror lag in seconds is a derived metric: `offset_lag / throughput_rate`. In PromQL:
+
+```promql
+confluent_kafka_server_cluster_link_mirror_topic_offset_lag{kafka_id="$CLUSTER_ID"}
+  / on(topic)
+  rate(confluent_kafka_server_received_records{kafka_id="$CLUSTER_ID"}[5m])
+```
+
+## Grafana and Prometheus
+
+### Auto-discovery rules
+
+The Grafana dashboards use template variable-based auto-discovery so you do not need to enumerate topics or connectors manually.
+
+| Variable | Default | Description |
+|---|---|---|
+| `{{CLUSTER_ID}}` | (required) | Target Kafka cluster ID |
+| `{{DOMAIN_PREFIX}}` | `*` | Topic domain filter — e.g., `corebanking`, `fraud`, or `*` for all |
+| `{{ENVIRONMENT}}` | `prod` | Environment label |
+| `{{CONNECT_REST_URL}}` | `http://connect.internal:8083` | Connect REST endpoint for connector auto-discovery |
+| `{{CC_METRICS_API_KEY}}` | (required) | CC Metrics API key |
+| `{{CC_METRICS_API_SECRET}}` | (required) | CC Metrics API secret |
+| `{{JMX_EXPORTER_HOST}}` | `localhost` | JMX exporter host (CFK/CP) |
+| `{{JMX_EXPORTER_PORT}}` | `9101` | JMX exporter port |
+
+The Connect Status dashboard auto-discovers all connectors by querying the Connect REST API (`GET $CONNECT_REST_URL/connectors`) and iterating connector status for each. No static connector list is required.
+
+### JMX exporter config
+
+For CFK and CP deployments, Kafka broker JMX metrics are exposed via the Prometheus JMX Exporter agent on port `9101`. The `jmx-exporter-config.yaml` file in `observability/grafana/` configures MBean patterns for broker, Schema Registry, and Connect metrics. Key JMX ports per component:
+
+| Component | JMX port |
+|---|---|
+| Kafka broker | 8080 |
+| Schema Registry | 8078 |
+| Kafka Connect | 8077 |
+| ZooKeeper | 8079 |
+
+CC Flink metrics (`io.confluent.flink/*`) are available through the CC Metrics API. The CC Metrics API does not expose a checkpoint duration metric — use `pending_records` as a backpressure proxy and `num_records_out` rate for throughput monitoring.
+
+### Prometheus alert rules
+
+Alert rules in `observability/grafana/alerts.yaml` are organized into four Grafana alert groups:
+
+- `fsi-kafka-mirror-lag` — SLA-tier-specific mirror lag warnings and alerts (8 rules, 1-minute evaluation)
+- `fsi-kafka-consumer-lag` — SLA-tier-specific consumer lag warnings and alerts (8 rules, 1-minute evaluation)
+- `fsi-kafka-connect` — Connect task FAILED state and restart loop detection (2 rules)
+- `fsi-kafka-cluster-health` — Under-replicated partitions and no active controller (2 rules)
+- `fsi-kafka-flink` — Pending records backpressure and throughput drop (3 rules)
+
+## Observability setup
+
+<Tabs>
+  <Tab title="Ansible (cp_observability role)">
+
+The `cp_observability` Ansible role automates the full observability stack for Confluent Platform on RHEL deployments. It deploys JMX exporter configs to broker, SR, and Connect nodes; generates Prometheus scrape targets from inventory; and imports Grafana dashboards and alert rules.
+
+### Role variables
+
+```yaml
+# JMX exporter ports (cp-ansible 7.7.x defaults)
+cp_obs_broker_jmx_port: 8080
+cp_obs_sr_jmx_port: 8078
+cp_obs_connect_jmx_port: 8077
+cp_obs_zk_jmx_port: 8079
+
+# Directories
+cp_obs_jmx_exporter_config_dir: "/opt/prometheus/jmx-exporter"
+cp_obs_prometheus_targets_dir: "/etc/prometheus/file_sd"
+
+# Cluster identification
+cp_obs_cluster_name: "fsi-kafka"
+cp_obs_environment: "prod"
+
+# Grafana connection
+cp_obs_grafana_url: "http://localhost:3000"
+cp_obs_grafana_api_key: ""
+cp_obs_grafana_method: "file_provisioning"
+cp_obs_grafana_provisioning_dir: "/etc/grafana/provisioning/dashboards"
+cp_obs_grafana_alert_provisioning_dir: "/etc/grafana/provisioning/alerting"
+
+# Feature flags
+cp_obs_deploy_jmx: true
+cp_obs_deploy_prometheus: true
+cp_obs_deploy_grafana: true
+cp_obs_deploy_alerts: true
+```
+
+### Running the role
+
+Include the role in your playbook and control which components deploy via feature flags:
+
+```yaml
+- hosts: kafka_broker:schema_registry:kafka_connect
+  roles:
+    - role: cp_observability
+      vars:
+        cp_obs_cluster_name: "fsi-prod"
+        cp_obs_environment: "prod"
+        cp_obs_grafana_url: "http://grafana.internal:3000"
+        cp_obs_grafana_api_key: "{{ vault_grafana_api_key }}"
+        cp_obs_deploy_jmx: true
+        cp_obs_deploy_prometheus: true
+        cp_obs_deploy_grafana: true
+        cp_obs_deploy_alerts: true
+```
+
+To deploy only JMX configs without touching Grafana:
+
+```yaml
+- hosts: kafka_broker
+  roles:
+    - role: cp_observability
+      vars:
+        cp_obs_deploy_jmx: true
+        cp_obs_deploy_prometheus: false
+        cp_obs_deploy_grafana: false
+        cp_obs_deploy_alerts: false
+```
+
+Use tags for selective Day-2 operations:
+
+```bash
+ansible-playbook site.yml --tags jmx
+ansible-playbook site.yml --tags grafana,alerts
+ansible-playbook site.yml --tags observability --check  # check mode (read-only)
+```
+
+The role dispatches to sub-task files (`jmx_exporter.yml`, `prometheus.yml`, `grafana.yml`) based on the feature flags, and outputs a `cp_observability_results` fact for downstream orchestration:
+
+```yaml
+cp_observability_results:
+  jmx_deployed: true
+  prometheus_deployed: true
+  grafana_deployed: true
+  alerts_deployed: true
+```
+
+  </Tab>
+
+  <Tab title="Manual import">
+
+### Grafana dashboard import
+
+1. Copy the dashboard JSON file from `observability/grafana/` (e.g., `dashboard-cluster-health.json`).
+2. Replace all template variables (see the variables table above).
+3. Import via the Grafana UI: **Dashboards → Import → Upload JSON file**, or via the API:
+
+```bash
+curl -s -X POST http://localhost:3000/api/dashboards/db \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GRAFANA_API_KEY" \
+  -d @dashboard-cluster-health.json
+```
+
+4. Verify data appears within 5 minutes.
+
+### Alert rules import
+
+1. Copy `observability/grafana/alerts.yaml` to `/etc/grafana/provisioning/alerting/`.
+2. Replace `${DS_PROMETHEUS}` with your actual datasource UID.
+3. Reload Grafana provisioning:
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/provisioning/alerting/reload \
+  -H "Authorization: Bearer $GRAFANA_API_KEY"
+```
+
+4. Verify alert rules appear in **Alerting → Alert rules → FSI Kafka**.
+
+### CC Metrics API datasource setup
+
+```bash
+# Obtain a Cloud API key from the Confluent Cloud console
+# (Cloud environment > API keys > Add key)
+
+# Replace placeholders and import the datasource
+sed \
+  -e 's/{{CC_METRICS_API_KEY}}/YOUR_KEY/g' \
+  -e 's/{{CC_METRICS_API_SECRET}}/YOUR_SECRET/g' \
+  -e 's/{{CLUSTER_ID}}/lkc-xxxxx/g' \
+  observability/grafana/cc-metrics-export.json \
+  > cc-datasource.json
+
+curl -s -X POST http://localhost:3000/api/datasources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GRAFANA_API_KEY" \
+  -d @cc-datasource.json
+```
+
+For multiple clusters, create one datasource per cluster with unique names (e.g., "CC Metrics - East", "CC Metrics - West").
+
+### JMX exporter setup (CFK/CP)
+
+```bash
+# Deploy the JMX exporter agent alongside Kafka brokers
+# Point it at the broker's JMX port using the provided config
+
+# Verify metrics are scraped (port 9101)
+curl -s http://localhost:9101/metrics | grep kafka_server_
+```
+
+  </Tab>
+</Tabs>
+
+## Provider setup
+
+Each provider directory under `observability/` contains a `README.md` with provider-specific setup steps, plus the following files:
+
+| Provider | Dashboard file | Alert file | JMX config |
+|---|---|---|---|
+| Grafana | `grafana/dashboard-*.json` (5 files) | `grafana/alerts.yaml` | `grafana/jmx-exporter-config.yaml` |
+| Dynatrace | `dynatrace/dashboard.json` | `dynatrace/alerts.json` | `dynatrace/jmx-exporter-config.json` |
+| Datadog | `datadog/dashboard.json` | `datadog/monitors.json` | `datadog/jmx-exporter-config.yaml` |
+| Splunk | `splunk/` | `splunk/` | — |
+| New Relic | `newrelic/` | `newrelic/` | — |
+| Instana | `instana/` | `instana/` | — |
+
+Metrics ingestion endpoints:
+
+| Provider | Endpoint | Authentication |
+|---|---|---|
+| Grafana/Prometheus | `https://api.telemetry.confluent.cloud/v2/metrics/cloud/export` | Basic auth (CC API key/secret) |
+| Dynatrace | `{ENV_URL}/api/v2/metrics/ingest` | API token with `metrics.ingest` scope |
+| Datadog | `https://api.datadoghq.com/api/v1/series` | API key + Application key |
+| Splunk | `https://{SPLUNK_HOST}:8088/services/collector` | HEC token |
+| New Relic | `https://metric-api.newrelic.com/metric/v1` | Ingest license key |
+| IBM Instana | `https://{INSTANA_HOST}/api/custom-dashboards` | API token |
+
+## Related pages
+
+- [Operations: DR runbook](/operations/dr-runbook) — how SLA-tier thresholds drive failover decisions
+- [Operations: Flink streaming](/operations/flink-streaming) — Flink job metrics and compute pool monitoring
+- [Governance: SLA tiers](/governance/sla-tiers) — tier definitions and threshold derivation
+- [Reference: Ansible roles](/reference/ansible-roles) — full `cp_observability` role reference

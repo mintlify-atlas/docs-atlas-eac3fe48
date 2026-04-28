@@ -1,0 +1,468 @@
+---
+title: "Python client reference: Avro producer and consumer"
+description: "FSI C4E Python Kafka client reference: Avro serialization, Schema Registry integration, Prometheus metrics, DLQ routing, and graceful shutdown."
+---
+
+The FSI Python client mirrors the Java reference implementation in every governance-relevant detail: idempotent production, manual offset commit, Avro serialization with the modern `confluent-kafka` serializer API, Prometheus metrics, and DLQ routing via `FsiDlqHandler`. Both `FsiProducer` and `FsiConsumer` support the context manager protocol, making resource cleanup automatic in application code. Copy the files from `reference/python-producer/` and `reference/python-consumer/` and adapt the handler logic; the transport and governance configuration is already correct.
+
+## Installation
+
+```bash
+pip install confluent-kafka[avro]==2.13.2 prometheus_client==0.24.1
+```
+
+Both the producer and consumer share the same `requirements.txt`:
+
+```
+confluent-kafka[avro]==2.13.2
+prometheus_client==0.24.1
+```
+
+<Tabs>
+  <Tab title="Producer">
+
+## Constructor
+
+`FsiProducer` accepts a `dict` config. Credentials are injected at call site from environment variables or a secrets manager.
+
+```python
+class FsiProducer:
+    """FSI C4E Reference Producer for Python applications.
+
+    Key characteristics:
+      - Idempotent (enable.idempotence=True) for exactly-once per partition
+      - Avro serialization with Schema Registry (modern AvroSerializer API)
+      - Prometheus metrics exposed via HTTP endpoint
+      - Graceful shutdown with flush + close
+      - DLQ routing for failed messages with error categorization
+
+    Usage:
+        config = {
+            "topic.name": "corebanking.transactions.v1.account-transaction",
+            "bootstrap.servers": "pkc-xxxxx.us-east-1.aws.confluent.cloud:9092",
+            "schema.registry.url": "https://psrc-xxxxx.us-east-1.aws.confluent.cloud",
+            "sasl.username": "<api-key>",
+            "sasl.password": "<api-secret>",
+        }
+        with FsiProducer(config) as producer:
+            producer.send("key-123", {"transaction_id": "tx-001", ...})
+    """
+```
+
+## Required config keys
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `topic.name` | Yes | — | Fully qualified topic name |
+| `bootstrap.servers` | No | `localhost:9092` | Kafka bootstrap address |
+| `schema.registry.url` | No | `http://localhost:8081` | Schema Registry endpoint |
+| `schema.registry.basic.auth.user.info` | No | — | SR credentials `api_key:secret` |
+| `sasl.username` | No | — | Confluent Cloud API key (enables SASL_SSL) |
+| `sasl.password` | No | — | Confluent Cloud API secret |
+| `value.schema` | No | — | Avro schema JSON string |
+| `client.id` | No | auto | Custom client identifier |
+| `dlq.enabled` | No | `"true"` | Set to `"false"` to disable DLQ |
+| `metrics.port` | No | `"9090"` | Prometheus HTTP port |
+
+## C4E mandatory producer settings
+
+```python
+producer_config = {
+    "bootstrap.servers": config.get("bootstrap.servers", "localhost:9092"),
+    # C4E MANDATORY: Idempotent producer
+    "enable.idempotence": True,
+    "acks": "all",
+    "max.in.flight.requests.per.connection": 5,
+    # Reliability
+    "retries": 2147483647,
+    "delivery.timeout.ms": 120000,
+    "request.timeout.ms": 30000,
+    # Performance
+    "compression.type": "zstd",
+    "batch.size": 32768,
+    "linger.ms": 20,
+    # Client identification
+    "client.id": client_id,
+}
+```
+
+## Schema Registry integration
+
+`FsiProducer` uses the modern `AvroSerializer` API, not the deprecated `AvroProducer`. Pass `value.schema` to register the schema on first produce, or omit it to use an already-registered subject.
+
+```python
+# Schema Registry client
+sr_config = {
+    "url": config.get("schema.registry.url", "http://localhost:8081"),
+}
+if config.get("schema.registry.basic.auth.user.info"):
+    sr_config["basic.auth.user.info"] = config["schema.registry.basic.auth.user.info"]
+
+self._sr_client = SchemaRegistryClient(sr_config)
+
+# Serializers -- modern API (NOT deprecated AvroProducer)
+self._key_serializer = StringSerializer("utf_8")
+
+if config.get("value.schema"):
+    from confluent_kafka.schema_registry import Schema
+
+    schema = Schema(config["value.schema"], "AVRO")
+    self._value_serializer = AvroSerializer(
+        self._sr_client,
+        schema,
+        to_dict=lambda obj, ctx: obj,
+    )
+else:
+    self._value_serializer = AvroSerializer(
+        self._sr_client,
+        to_dict=lambda obj, ctx: obj,
+    )
+```
+
+## send() — asynchronous
+
+```python
+def send(self, key: str, value: dict):
+    """Send a record asynchronously with callback-based error handling.
+
+    The key should be the natural business key (e.g., account_number,
+    transaction_id). The value should be a dict matching the Avro schema.
+    """
+    start_ms = time.time() * 1000
+
+    serialized_key = self._key_serializer(
+        key,
+        SerializationContext(self._topic_name, MessageField.KEY),
+    )
+    serialized_value = self._value_serializer(
+        value,
+        SerializationContext(self._topic_name, MessageField.VALUE),
+    )
+
+    def delivery_callback(err, msg):
+        latency = time.time() * 1000 - start_ms
+        self._last_latency_ms.labels(topic=self._topic_name).set(latency)
+
+        if err is not None:
+            self._total_errors.labels(topic=self._topic_name).inc()
+            log.error(
+                "Failed to produce to %s [key=%s]: %s",
+                self._topic_name, key, err,
+            )
+            # DLQ routing with retry classification
+            if self._dlq_handler is not None:
+                key_bytes = (
+                    key.encode("utf-8") if key is not None else None
+                )
+                self._dlq_handler.handle_error(
+                    key_bytes, serialized_value, err, 0
+                )
+                self._dlq_sent.labels(topic=self._topic_name).inc()
+        else:
+            self._total_sent.labels(topic=self._topic_name).inc()
+            log.debug(
+                "Produced to %s-%d offset=%d latency=%.0fms",
+                msg.topic(), msg.partition(), msg.offset(), latency,
+            )
+
+    self._producer.produce(
+        topic=self._topic_name,
+        key=serialized_key,
+        value=serialized_value,
+        on_delivery=delivery_callback,
+    )
+    self._producer.poll(0)
+```
+
+## send_sync() — blocking
+
+```python
+def send_sync(self, key: str, value: dict) -> dict:
+    """Send a record synchronously (blocking).
+
+    Returns:
+        Dict with 'topic', 'partition', 'offset' of the produced message.
+
+    Raises:
+        KafkaException: If the produce fails.
+    """
+    result = {}
+    error_holder = [None]
+
+    def delivery_callback(err, msg):
+        if err is not None:
+            error_holder[0] = err
+            self._total_errors.labels(topic=self._topic_name).inc()
+        else:
+            result["topic"] = msg.topic()
+            result["partition"] = msg.partition()
+            result["offset"] = msg.offset()
+            self._total_sent.labels(topic=self._topic_name).inc()
+
+    serialized_key = self._key_serializer(
+        key, SerializationContext(self._topic_name, MessageField.KEY),
+    )
+    serialized_value = self._value_serializer(
+        value, SerializationContext(self._topic_name, MessageField.VALUE),
+    )
+
+    self._producer.produce(
+        topic=self._topic_name,
+        key=serialized_key,
+        value=serialized_value,
+        on_delivery=delivery_callback,
+    )
+    self._producer.flush()
+
+    if error_holder[0] is not None:
+        raise KafkaException(error_holder[0])
+
+    return result
+```
+
+  </Tab>
+  <Tab title="Consumer">
+
+## Constructor
+
+`FsiConsumer` accepts a config dict and a `callable(key: str, value: dict)` handler. Signal handlers for `SIGTERM` and `SIGINT` are registered automatically.
+
+```python
+class FsiConsumer:
+    """FSI C4E Reference Consumer for Python applications.
+
+    Key characteristics:
+      - Avro deserialization with Schema Registry (modern AvroDeserializer API)
+      - Manual offset commit (at-least-once delivery guarantee)
+      - Graceful shutdown via SIGTERM/SIGINT signal handlers
+      - Prometheus metrics exposed via HTTP endpoint
+      - Configurable record handler via callable
+
+    Usage:
+        def handle_record(key: str, value: dict):
+            print(f"Received: {key} -> {value}")
+
+        config = {
+            "group.id": "corebanking-txn-processor",
+            "topics": "corebanking.transactions.v1.account-transaction",
+            "bootstrap.servers": "localhost:9092",
+            "schema.registry.url": "http://localhost:8081",
+        }
+        with FsiConsumer(config, handle_record) as consumer:
+            consumer.start()  # Blocks until shutdown signal
+    """
+```
+
+## Required config keys
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `group.id` | Yes | — | Consumer group identifier |
+| `topics` | Yes | — | Comma-separated topic names |
+| `bootstrap.servers` | No | `localhost:9092` | Kafka bootstrap address |
+| `schema.registry.url` | No | `http://localhost:8081` | Schema Registry endpoint |
+| `schema.registry.basic.auth.user.info` | No | — | SR credentials `api_key:secret` |
+| `sasl.username` | No | — | Confluent Cloud API key (enables SASL_SSL) |
+| `sasl.password` | No | — | Confluent Cloud API secret |
+| `client.id` | No | auto | Custom client identifier |
+| `metrics.port` | No | `"9091"` | Prometheus HTTP port |
+
+## Avro deserialization
+
+```python
+# Schema Registry client
+sr_client = SchemaRegistryClient(sr_config)
+
+# Deserializers -- modern API
+self._key_deserializer = StringDeserializer("utf_8")
+self._value_deserializer = AvroDeserializer(sr_client)
+```
+
+## Poll loop with manual commit
+
+```python
+def start(self):
+    """Start the consume loop. Blocks until shutdown signal."""
+    self._running = True
+    self._consumer.subscribe(self._topics)
+    log.info("Consumer subscribed to: %s", self._topics)
+
+    try:
+        while self._running:
+            msg = self._consumer.poll(timeout=1.0)
+
+            if msg is None:
+                continue
+
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                log.error("Consumer error: %s", msg.error())
+                self._total_errors.labels(group=self._group_id).inc()
+                continue
+
+            # Deserialize key and value
+            try:
+                key = self._key_deserializer(
+                    msg.key(),
+                    SerializationContext(msg.topic(), MessageField.KEY),
+                )
+                value = self._value_deserializer(
+                    msg.value(),
+                    SerializationContext(msg.topic(), MessageField.VALUE),
+                )
+            except Exception as e:
+                self._total_errors.labels(group=self._group_id).inc()
+                log.error(
+                    "Deserialization error [topic=%s, partition=%d, offset=%d]: %s",
+                    msg.topic(), msg.partition(), msg.offset(), e,
+                )
+                continue
+
+            # Invoke handler
+            try:
+                self._handler(key, value)
+                self._total_consumed.labels(group=self._group_id).inc()
+            except Exception as e:
+                self._total_errors.labels(group=self._group_id).inc()
+                log.error(
+                    "Error processing record [topic=%s, partition=%d, offset=%d, key=%s]: %s",
+                    msg.topic(), msg.partition(), msg.offset(), key, e,
+                )
+                # Default: log and continue (at-least-once semantics)
+
+            # Commit offset after successful processing
+            try:
+                commit_start = time.time() * 1000
+                self._consumer.commit(asynchronous=False)
+                commit_latency = time.time() * 1000 - commit_start
+                self._last_commit_latency_ms.labels(
+                    group=self._group_id
+                ).set(commit_latency)
+            except KafkaException as e:
+                log.error("Commit failed: %s", e)
+
+    finally:
+        log.info(
+            "Closing consumer. Total consumed: %d, errors: %d",
+            consumed, errors,
+        )
+        self._consumer.close()
+```
+
+  </Tab>
+  <Tab title="DLQ">
+
+## DLQ handler
+
+`FsiDlqHandler` routes failed messages to `{source-topic}.dlq` with error categorization, exponential backoff with jitter, and Kafka header metadata.
+
+```python
+# Error codes that should NOT be retried -- send directly to DLQ
+NON_RETRYABLE_ERRORS = {
+    KafkaError._VALUE_SERIALIZATION,
+    KafkaError._KEY_SERIALIZATION,
+    KafkaError._VALUE_DESERIALIZATION,
+    KafkaError._KEY_DESERIALIZATION,
+    KafkaError.TOPIC_AUTHORIZATION_FAILED,
+    KafkaError.GROUP_AUTHORIZATION_FAILED,
+    KafkaError.CLUSTER_AUTHORIZATION_FAILED,
+}
+
+# Maximum retry attempts before routing to DLQ
+MAX_RETRIES = 3
+
+# Base backoff in seconds (doubles each retry: 1s, 2s, 4s)
+BASE_BACKOFF_S = 1
+```
+
+## handle_error()
+
+```python
+def handle_error(
+    self,
+    key: bytes,
+    value_bytes: bytes,
+    error,
+    retry_count: int = 0,
+):
+    """Handle a failed message by classifying and routing.
+
+    Returns:
+        None if message was sent to DLQ.
+        Tuple of ("retry", backoff_seconds) if caller should retry.
+    """
+    error_code = getattr(error, "code", lambda: None)()
+
+    # Non-retryable errors go directly to DLQ
+    if error_code in NON_RETRYABLE_ERRORS:
+        log.warning(
+            "Non-retryable error on %s: %s -- routing to DLQ",
+            self._source_topic, error,
+        )
+        self._send_to_dlq(key, value_bytes, error, retry_count)
+        return None
+
+    # Retryable errors: retry with backoff up to MAX_RETRIES
+    if retry_count < MAX_RETRIES:
+        backoff = BASE_BACKOFF_S * (2 ** retry_count) + random.uniform(
+            0, 0.1 * (2 ** retry_count)
+        )
+        log.info(
+            "Retryable error on %s (attempt %d/%d), backoff %.2fs: %s",
+            self._source_topic, retry_count + 1, MAX_RETRIES, backoff, error,
+        )
+        return ("retry", backoff)
+
+    # Exhausted retries -- route to DLQ
+    self._send_to_dlq(key, value_bytes, error, retry_count)
+    return None
+```
+
+## Error categories
+
+| Category | Triggered by |
+|----------|-------------|
+| `SERIALIZATION` | Key/value serialization or deserialization failure |
+| `SCHEMA_INCOMPATIBLE` | Schema Registry compatibility rejection |
+| `BROKER_TIMEOUT` | Broker unreachable or request timed out |
+| `AUTH_DENIED` | Topic, group, or cluster authorization failure |
+| `UNKNOWN` | Unrecognized error |
+
+## DLQ record headers
+
+Every DLQ record carries the following Kafka headers:
+
+| Header | Content |
+|---|---|
+| `dlq.original.topic` | Source topic name |
+| `dlq.error.type` | Error category string |
+| `dlq.error.message` | Error message, truncated to 1024 bytes |
+| `dlq.timestamp` | ISO-8601 UTC timestamp |
+| `dlq.retry.count` | Number of retry attempts |
+| `dlq.producer.client.id` | Originating client ID |
+
+  </Tab>
+</Tabs>
+
+## Prometheus metrics
+
+Both producer and consumer expose Prometheus counters and gauges labeled by topic or group. The metrics HTTP server starts on a daemon thread during `__init__`.
+
+| Metric | Type | Label | Description |
+|--------|------|-------|-------------|
+| `fsi_producer_total_sent` | Counter | `topic` | Total messages sent successfully |
+| `fsi_producer_total_errors` | Counter | `topic` | Total send errors |
+| `fsi_producer_last_latency_ms` | Gauge | `topic` | Last send latency in milliseconds |
+| `fsi_producer_dlq_sent` | Counter | `topic` | Total messages routed to DLQ |
+| `fsi_consumer_total_consumed` | Counter | `group` | Total messages consumed successfully |
+| `fsi_consumer_total_errors` | Counter | `group` | Total processing errors |
+| `fsi_consumer_last_poll_count` | Gauge | `group` | Records in last poll batch |
+| `fsi_consumer_last_commit_latency_ms` | Gauge | `group` | Last commit latency in milliseconds |
+
+## Related pages
+
+- [Governance: schema guide](/governance/schema-guide) — Avro schema evolution and compatibility rules
+- [Reference: Java client](/reference/java-client)
+- [Reference: .NET client](/reference/dotnet-client)
+- [Operations: observability](/operations/observability) — Prometheus scrape configuration

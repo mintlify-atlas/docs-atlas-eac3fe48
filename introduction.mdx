@@ -1,0 +1,71 @@
+---
+title: "Governed Kafka infrastructure for financial institutions"
+description: "Kafka, Flink, and Schema Registry with FSI-grade governance, DR, and compliance automation — deployable across eight infrastructure models in hours."
+---
+
+Financial institutions building on Kafka face a recurring challenge: every team re-implements the same governance, security, DR, and observability layers from scratch, spending months before the first message flows. The FSI Data Streaming Platform eliminates that rework. It packages all of those layers as scenario-based starter kits — parameterized, tested automation that any FSI team can deploy against their chosen infrastructure in hours, not months. A single command produces a production-grade Kafka/Flink/Schema Registry environment that already satisfies the naming, compatibility, RBAC, retention, and DR requirements that regulators expect.
+
+## Navigate the platform
+
+<CardGroup cols={2}>
+  <Card title="Governance" icon="scale-balanced" href="/governance/topic-onboarding">
+    Topic naming, schema compatibility, SLA tiers, and RBAC — enforced identically across all eight deployment models.
+  </Card>
+  <Card title="Deployment" icon="server" href="/deployment/confluent-cloud">
+    Scenario guides for Confluent Cloud (AWS, Azure, GCP), CFK on OpenShift, CP on RHEL, Private Cloud, and LinuxONE.
+  </Card>
+  <Card title="Operations" icon="arrows-rotate" href="/operations/dr-runbook">
+    DR runbooks, observability dashboards, credential rotation, and Flink streaming reference patterns.
+  </Card>
+  <Card title="Compliance" icon="file-shield" href="/compliance/compliance-guide">
+    FIPS 140-2 validation, FSI regulatory requirements, and the architecture decision record index.
+  </Card>
+</CardGroup>
+
+## What the platform is
+
+The platform is organized into eight deployment scenarios — each a self-contained directory under `scenarios/` — backed by shared governance modules and Ansible roles that enforce identical rules regardless of where Kafka runs. Every scenario provisions Kafka brokers, Schema Registry, Kafka Connect, and Flink, wires them together with mTLS and RBAC, registers Avro schemas, and configures DR replication. The shared `modules/topic/` Terraform module and the ten Ansible roles do all of that from a single topic declaration: specify a domain, entity, SLA tier, and owner, and the automation derives every other configuration value.
+
+## Who it's for
+
+The platform targets the engineering teams inside financial institutions that own Kafka infrastructure: platform engineers standing up new clusters, C4E (Center of Excellence) teams setting governance standards, and application teams onboarding their first topics. It also serves architects evaluating deployment models and compliance officers who need audit trails and DR drill reports.
+
+## Key capabilities
+
+<CardGroup cols={3}>
+  <Card title="Governance as code" icon="code-branch">
+    One topic declaration produces the topic, Avro schema, RBAC bindings, metadata tags, and DR mirror automatically. SLA tiers (`critical`, `standard`, `best-effort`, `compliance`) drive all config defaults.
+  </Card>
+  <Card title="Eight deployment scenarios" icon="layer-group">
+    Confluent Cloud (AWS, Azure, GCP), CFK on OpenShift, CP on RHEL, Private Cloud, and LinuxONE variants — all with governance parity.
+  </Card>
+  <Card title="Three DR backends" icon="shield-halved">
+    Cluster Linking, MirrorMaker 2, and Multi-Region Cluster (RPO=0) behind one unified CLI and Ansible playbooks with dry-run and audit mode.
+  </Card>
+  <Card title="Six observability providers" icon="chart-line">
+    Import-ready dashboard templates for Dynatrace, Datadog, Splunk, Grafana/Prometheus, New Relic, and IBM Instana with SLA-tier alert thresholds.
+  </Card>
+  <Card title="FSI security and compliance" icon="lock">
+    mTLS, MDS RBAC, FIPS 140-2 validation, CSFLE field-level encryption, Vault/KMS credential rotation, and configurable retention up to 7 years for OFAC/AML.
+  </Card>
+  <Card title="CI/CD pipeline" icon="gear">
+    Automated C4E pre-check validates topic naming, schema compatibility, RBAC, and SLA tiers across Terraform, CFK YAML, and CPTopic formats before every merge.
+  </Card>
+</CardGroup>
+
+## All eight deployment models
+
+Every scenario enforces identical governance: topic naming, schema compatibility, RBAC patterns, and SLA-tier defaults are driven by the same shared modules and filter plugins regardless of deployment model.
+
+| Scenario | Path | Tooling | Cloud / Infrastructure |
+|---|---|---|---|
+| Confluent Cloud — AWS | `scenarios/cc-aws/` | Terraform | AWS (PrivateLink, Secrets Manager) |
+| Confluent Cloud — Azure | `scenarios/cc-azure/` | Terraform | Azure (Private Endpoint, Key Vault) |
+| Confluent Cloud — GCP | `scenarios/cc-gcp/` | Terraform | GCP (Private Service Connect, Secret Manager) |
+| CFK on OpenShift | `scenarios/cfk-openshift/` | Helm / CFK Operator | OpenShift 4.14–4.21 |
+| CP on RHEL | `scenarios/cp-rhel/` | Ansible / systemd | Bare-metal or VM, RHEL 8/9 |
+| Private Cloud | `scenarios/private-cloud/` | Terraform | Self-managed Confluent Platform |
+| CP on RHEL on LinuxONE | `scenarios/cp-rhel-linuxone/` | Ansible / systemd | IBM LinuxONE s390x |
+| CFK on OpenShift on LinuxONE | `scenarios/cfk-openshift-linuxone/` | Helm / CFK Operator | OpenShift on IBM LinuxONE s390x |
+
+See [Deployment models](/deployment-models) for a full breakdown of use cases and selection guidance.

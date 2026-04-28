@@ -1,0 +1,215 @@
+---
+title: "Architecture Decision Records: design rationale index"
+description: "All nine FSI platform Architecture Decision Records — schema format, DR strategy, auth, topic naming, and LinuxONE guidance with rationale."
+---
+
+Architecture Decision Records (ADRs) are the authoritative source of design rationale for the FSI Data Streaming Platform. Each ADR documents a specific decision made by the C4E team: the context that forced a choice, the decision itself, the reasoning behind it, and the consequences that follow. ADRs are not aspirational — they record decisions that are already implemented and in effect. Reading them tells you not just what the platform does, but why it does it that way and what trade-offs were accepted. For engineers extending the platform, for architects evaluating adoption, and for compliance teams who need to understand why specific controls exist, the ADRs are the definitive reference.
+
+## What ADRs are and why they exist
+
+Every non-trivial design decision involves trade-offs. Without a record of those trade-offs, future engineers encounter constraints they don't understand, make changes that undo carefully considered decisions, or spend time re-litigating settled questions. ADRs prevent that. They capture the decision in the context of the forces that shaped it — the regulatory requirements, the operational constraints, the vendor capabilities, and the performance characteristics that were true at the time the decision was made.
+
+The nine ADRs in this index cover the major cross-cutting decisions in the platform: how data is serialized, how schema changes are controlled, how services discover each other during disaster recovery, how authentication works across deployment models, and how the platform is made to work on IBM LinuxONE. Together they explain the architecture that the platform's Terraform modules, CI/CD pipeline, and operational runbooks implement.
+
+## ADR index
+
+<CardGroup cols={3}>
+  <Card title="ADR-001: Avro as default schema format" icon="file-code" href="/compliance/adr-index#adr-001">
+    Avro is the standard serialization format for all FSI topics, chosen for compact binary encoding, strong typing with financial logical types, and first-class Confluent toolchain support.
+  </Card>
+  <Card title="ADR-002: Compatibility modes by SLA tier" icon="shield-check" href="/compliance/adr-index#adr-002">
+    Schema compatibility mode is automatically derived from the topic's SLA tier, ensuring critical topics have maximum schema protection without per-topic configuration.
+  </Card>
+  <Card title="ADR-003: Consul for service discovery" icon="network-wired" href="/compliance/adr-index#adr-003">
+    Consul manages DR-sensitive endpoint resolution, enabling a single KV update to flip Kafka, Schema Registry, and Oracle JDBC endpoints atomically during failover.
+  </Card>
+  <Card title="ADR-004: Self-managed Connect on-prem" icon="server" href="/compliance/adr-index#adr-004">
+    Kafka Connect workers are deployed on-premises next to Oracle databases to minimize JDBC latency for core banking workloads that require sub-millisecond connector response.
+  </Card>
+  <Card title="ADR-005: Cluster Linking over MRC" icon="arrows-left-right" href="/compliance/adr-index#adr-005">
+    Cluster Linking between two Confluent Cloud dedicated clusters meets FSI's ~2-hour RPO target without the self-managed infrastructure that Multi-Region Clusters require.
+  </Card>
+  <Card title="ADR-006: OAuth vs API Keys" icon="key" href="/compliance/adr-index#adr-006">
+    OAuth/OAUTHBEARER is the primary authentication mechanism for application workloads; API keys are retained for Terraform provider authentication and environments without IdP integration.
+  </Card>
+  <Card title="ADR-007: Topic naming convention" icon="tag" href="/compliance/adr-index#adr-007">
+    Topics follow the `{domain}.{application}.{version}.{entity}` pattern, enabling prefix-based RBAC, dashboard auto-discovery, and explicit versioned migration paths for breaking schema changes.
+  </Card>
+  <Card title="ADR-008: DR tier classification" icon="database" href="/compliance/adr-index#adr-008">
+    Each SLA tier carries explicit RPO/RTO targets and a mapped DR backend, ensuring compliance-tier topics achieve RPO=0 and critical-tier topics meet sub-5-minute RPO requirements.
+  </Card>
+  <Card title="ADR-009: LinuxONE deployment guidance" icon="microchip" href="/compliance/adr-index#adr-009">
+    IBM LinuxONE (s390x) is a first-class deployment model using IBM Semeru 17, PKCS12 keystores, and the IBM FIPS crypto providers rather than the Bouncy Castle stack used on x86.
+  </Card>
+</CardGroup>
+
+## Decision details
+
+<AccordionGroup>
+  <Accordion title="ADR-001 — Avro as the default schema format">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** FSI needs a standard serialization format for all Kafka topics. Confluent Schema Registry supports Avro, Protobuf, and JSON Schema. The choice affects message size, schema evolution semantics, tooling compatibility, and developer experience across all deployment models.
+
+    **Decision:** Apache Avro is the default schema format for all new FSI topics. Protobuf is an acceptable alternative for teams with existing Protobuf infrastructure, subject to C4E approval. JSON Schema is not permitted for production topics.
+
+    **Rationale:**
+    - Compact binary serialization reduces Confluent Cloud storage and network costs compared to JSON Schema
+    - Strong typing with logical types (`decimal`, `timestamp-millis`, `date`) maps directly to financial data requirements
+    - `FULL_TRANSITIVE` compatibility is well-defined in Avro and reliably enforced by Schema Registry
+    - First-class support across Confluent Connect, Flink SQL, and TableFlow — no adapter required
+    - Avro is the dominant format in FSI Kafka deployments industry-wide, minimizing hiring and integration friction
+
+    **Consequences:** All teams must learn Avro schema authoring, mitigated by reference schemas in `/schemas`. Schema evolution must follow Avro compatibility rules documented in the [schema guide](/governance/schema-guide). Teams with existing Protobuf services need an approved exception or adapter layer.
+  </Accordion>
+
+  <Accordion title="ADR-002 — Schema compatibility modes by SLA tier">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** Schema compatibility controls whether a proposed schema change is accepted or rejected by Schema Registry. Different topics have different risk profiles — core banking transactions require maximum protection against breaking changes, while integration events need more flexibility for rapid iteration.
+
+    **Decision:** Compatibility mode is automatically derived from the topic's SLA tier by the Terraform module. An optional `compatibility_override` variable exists for documented exceptions.
+
+    | SLA tier | Compatibility mode | Rationale |
+    |----------|--------------------|-----------|
+    | critical | `FULL_TRANSITIVE` | Both forward and backward compatible across all schema versions |
+    | standard | `BACKWARD_TRANSITIVE` | Consumers can be upgraded before producers safely |
+    | best-effort | `BACKWARD` | Standard Confluent default |
+
+    OFAC topics use `FULL_TRANSITIVE` regardless of SLA tier as a compliance and audit requirement, enforced via a Terraform override.
+
+    **Rationale:** Deriving compatibility from SLA tier eliminates per-topic misconfiguration risk. A critical topic can never accidentally be set to `BACKWARD` compatibility by an engineer unfamiliar with the implications.
+
+    **Consequences:** Critical topics cannot have fields removed or types changed — schema evolution is limited to adding optional fields with defaults. Teams must plan schema changes for critical topics carefully (shift-left schema design). Standard topics have more flexibility but still protect consumers from unplanned breaking changes.
+  </Accordion>
+
+  <Accordion title="ADR-003 — Consul for service discovery over DNS-only">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** During DR failover, applications and Connect workers must resolve three endpoints simultaneously: Kafka bootstrap, Schema Registry, and Oracle JDBC. The options evaluated were hardcoded URLs with manual rotation, DNS CNAME with TTL-based failover, and Consul-based service discovery.
+
+    **Decision:** HashiCorp Consul is the service discovery mechanism for all DR-sensitive endpoints. A single Consul KV key (`fsi/kafka/active-region`) determines which region's endpoints are active. All three endpoint types are resolved through Consul DNS or KV lookups.
+
+    **Rationale:**
+    - A single KV update flips all three endpoints atomically, compared to updating three separate DNS records
+    - Consul health checks can auto-detect Oracle Data Guard failover completion without manual operator intervention
+    - Consul integrates with HashiCorp Vault for credential rotation, which is already deployed in the FSI stack
+    - DNS TTL caching causes stale endpoint resolution; Consul DNS has configurable TTL down to zero
+    - The service discovery POC is an approved Phase 2 deliverable, reducing adoption risk
+
+    **Consequences:** Consul becomes a dependency for DR failover and must be deployed in high-availability configuration. Connect workers and applications must resolve endpoints via Consul DNS, requiring configuration changes. Consul cluster health must be monitored as part of the platform observability stack. The simplified failover runbook shrinks from 17 steps to 6. The same mechanism works for Oracle, Neo4j, and any future database endpoints added to the platform.
+  </Accordion>
+
+  <Accordion title="ADR-004 — Self-managed Connect on-prem over managed connectors">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** FSI's core banking (CNCB) and compliance (OFAC) applications use JDBC source and sink connectors to Oracle databases hosted on-premises. The evaluated options were fully managed Confluent Cloud connectors (via PrivateLink to on-prem Oracle) or self-managed Connect workers deployed in FSI's data center directly alongside Oracle.
+
+    **Decision:** Self-managed Kafka Connect workers are deployed on-premises in FSI's data center, connecting to Confluent Cloud via PrivateLink for Kafka connectivity.
+
+    **Rationale:**
+    - Co-location with Oracle minimizes JDBC latency — sub-millisecond on-prem versus 5–20ms through PrivateLink for managed connectors
+    - CNCB transaction throughput is sensitive to connector latency at the volumes required
+    - FSI already operates an existing Connect deployment as part of Phase 2 scope
+    - On-prem workers can use Consul for Oracle endpoint resolution during DR failover
+    - Managed connectors on Confluent Cloud do not support data contract rules execution
+
+    **Consequences:** The FSI operations team is responsible for Connect worker health, upgrades, and scaling. Distributed properties files must be maintained for both East and West Kafka bootstrap endpoints. DR failover includes connector pause/resume steps, which are scripted in the DR runbook. Connect worker JMX metrics must be exported to Dynatrace via OneAgent for observability parity with other platform components.
+  </Accordion>
+
+  <Accordion title="ADR-005 — Cluster Linking over MRC for current RPO targets">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** FSI's DR targets are RTO 2–6 hours by tier and RPO approximately 2 hours. Two patterns were evaluated: Cluster Linking (two separate Confluent Cloud clusters, asynchronous replication, manual failover) and Multi-Region Clusters (single stretched cluster, synchronous replication, automatic failover, RPO=0). MRC with synchronous replication and observer promotion is a Confluent Platform feature not available on Confluent Cloud.
+
+    **Decision:** Cluster Linking between two Confluent Cloud dedicated clusters (East active, West passive DR). MRC with RPO=0 is documented as a future-state option requiring migration to Confluent Platform.
+
+    **Rationale:**
+    - FSI's ~2h RPO target is easily met by Cluster Linking — mirror lag is typically measured in seconds
+    - Cluster Linking is fully managed on Confluent Cloud with no infrastructure to operate
+    - MRC requires Confluent Platform (self-managed), which contradicts the Confluent Cloud adoption direction
+    - The Consul proxy pattern reduces Cluster Linking's manual failover to 6 scripted steps
+    - The RTO bottleneck is Oracle Data Guard (5–30 minutes), not Kafka failover itself
+
+    **Consequences:** RPO is greater than zero, bounded by mirror lag (typically seconds, well within the 2h target). Failover is not fully automatic — it requires 6 scripted steps versus MRC's automatic promotion. If RPO requirements tighten to zero in the future, the architecture must change to Confluent Platform with MRC. Two separate clusters incur separate Confluent Cloud billing, mitigated by the DR cluster remaining idle under normal conditions.
+  </Accordion>
+
+  <Accordion title="ADR-006 — OAuth vs API Keys for Kafka authentication">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** The platform supports multiple deployment models, each requiring authentication for producers, consumers, and administrative operations. API keys (static credentials) are simple to provision via Terraform but require manual rotation. OAuth/OAUTHBEARER tokens are short-lived and auto-expire, but require IdP infrastructure. FSI regulatory requirements mandate credential rotation policies with a 90-day maximum for static credentials.
+
+    **Decision:** OAuth/OAUTHBEARER is the recommended primary authentication mechanism for Confluent Cloud application workloads. API keys are retained as a fallback for environments without IdP integration and for Terraform provider authentication, which does not support OAuth.
+
+    | Deployment model | Primary auth | Fallback | IdP |
+    |------------------|-------------|----------|-----|
+    | CC on Azure | OAUTHBEARER | API Keys | Azure AD (Entra ID) |
+    | CC on AWS | OAUTHBEARER | API Keys | AWS IAM Identity Center |
+    | CC on GCP | OAUTHBEARER | API Keys | Google Workspace / Cloud Identity |
+    | CFK on OpenShift | LDAP/AD via MDS | RBAC tokens | Active Directory |
+    | CP on RHEL | MDS with LDAP | SASL/PLAIN | Active Directory / LDAP |
+
+    **Rationale:** OAuth tokens auto-expire (recommended: 1 hour lifetime), making rotation automatic for application workloads. Client libraries handle token refresh without application restarts. API key rotation under the 90-day FSI policy requires a coordinated dual-credential window, which OAuth eliminates for application workloads.
+
+    **Consequences:** Credential rotation is automatic for OAuth-using application workloads, and authentication events are centrally logged via the IdP. Initial IdP setup requires coordination with the identity team, and each cloud provider has a different OAUTHBEARER configuration. Terraform provider authentication remains API-key-based with a separate quarterly rotation process. Local development environments may use API keys for simplicity.
+  </Accordion>
+
+  <Accordion title="ADR-007 — Topic naming convention">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** Kafka topic names are permanent once created — renaming requires creating a new topic and migrating all consumers. A consistent naming convention is essential for discovery, RBAC wildcard bindings, observability dashboard auto-discovery, Schema Registry subject naming, and governance metadata derivation. The convention must work across all deployment models and cloud providers.
+
+    **Decision:** Topic names follow the pattern `{domain}.{application}.{version}.{entity}`.
+
+    | Segment | Regex | Example |
+    |---------|-------|---------|
+    | domain | `^[a-z][a-z0-9-]{1,30}$` | `corebanking` |
+    | application | `^[a-z][a-z0-9-]{1,30}$` | `transactions` |
+    | version | `^v[0-9]+$` | `v1` |
+    | entity | `^[a-z][a-z0-9-]{1,60}$` | `account-transaction` |
+
+    Examples: `corebanking.transactions.v1.account-transaction`, `fraud.detection.v1.alert-signal`, `compliance.screening.v1.match-result`.
+
+    **Rationale:** Dots are the standard hierarchical separator in Kafka and enable prefix-based RBAC: a `DeveloperRead` binding on `corebanking.*` grants read access to all corebanking topics. The version segment makes dual-version migration explicit — when a breaking schema change is required, a `v2` topic is created alongside `v1` and both coexist during the migration window. Using dots consistently avoids the Kafka metrics naming collision between `.` and `_`.
+
+    **Consequences:** Topic discovery by domain prefix, RBAC wildcard bindings, and dashboard auto-discovery all work without additional tooling. Naming validation is enforceable in the Terraform module and CI pipeline. Breaking change migration via versioned topics is an explicit, discoverable pattern. Teams must agree on domain boundaries upfront, which is a governance requirement regardless of naming convention.
+  </Accordion>
+
+  <Accordion title="ADR-008 — DR tier classification">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** The platform operates across four SLA tiers with different business criticality and regulatory requirements. DR capabilities must be proportional to tier. Critical topics (core banking, fraud) require near-zero data loss. Compliance topics (OFAC, AML) require zero data loss for regulatory audit trails. Best-effort topics tolerate significant data loss. Different DR backends provide different RPO/RTO characteristics across deployment models.
+
+    **Decision:** Each SLA tier carries explicit RPO/RTO targets and a mirror lag alert threshold. DR backend selection is deterministic per deployment model.
+
+    | SLA tier | RPO target | RTO target | DR priority | Mirror lag alert |
+    |----------|-----------|-----------|-------------|-----------------|
+    | critical | < 5 minutes | < 15 minutes | P1 — immediate | Warn at 30s, alert at 60s |
+    | standard | < 2 hours | < 1 hour | P2 — business hours | Warn at 5m, alert at 15m |
+    | best-effort | < 24 hours | < 4 hours | P3 — next business day | Warn at 1h, alert at 4h |
+    | compliance | RPO = 0 | < 15 minutes | P1 — immediate | Warn at 10s, alert at 30s |
+
+    For compliance-tier RPO=0 on CP on RHEL, Multi-Region Clusters with automatic observer promotion provide synchronous replication. On Confluent Cloud, Cluster Linking provides near-zero RPO with enhanced mirror lag monitoring — true RPO=0 is not available on CC without MRC.
+
+    **Rationale:** Deriving mirror lag alert thresholds from SLA tier eliminates per-topic manual configuration. Failover priority ordering (P1 before P2 before P3) enables structured triage during multi-topic outages. Compliance teams have a documented RPO=0 strategy for regulatory audits.
+
+    **Consequences:** Compliance-tier RPO=0 on Confluent Cloud requires regulatory approval to accept near-zero instead of absolute zero. MRC for compliance-tier topics on CP adds latency to produce calls due to synchronous replication. Teams must correctly classify their topics — under-classification risks inadequate DR with no automatic safeguard. Mirror lag alerting requires observability platform integration per provider.
+  </Accordion>
+
+  <Accordion title="ADR-009 — LinuxONE / s390x deployment guidance">
+    **Status:** Accepted | **Date:** 2026-03-21
+
+    **Context:** Financial institutions running IBM LinuxONE need certified deployment patterns for Confluent Platform on RHEL (s390x) and CFK on OpenShift (s390x). The key differences from x86 deployments involve JDK selection, keystore format, FIPS compliance path, and optional CEX hardware security module integration. Without explicit guidance, teams default to x86 patterns that do not work on s390x.
+
+    **Decision:** Six s390x-specific decisions establish LinuxONE as a first-class deployment model:
+
+    1. **Software keys by default, CEX optional** — The `cp_mtls` Ansible role defaults to software-based PKCS12 keystores. CEX/PKCS#11 HSM support is available as an optional overlay (`cp_mtls_keystore_backend: pkcs11`) for customers requiring hardware-backed private keys.
+    2. **On-target keystore assembly** — Private keys are generated and keystores assembled on the target host, never on the Ansible controller. This is required for FIPS compliance (keys must be generated within the FIPS boundary) and ensures cross-JDK portability.
+    3. **PKCS12 only, not JKS or BCFKS** — JKS is deprecated. BCFKS is x86/OpenJDK-specific and not supported by IBM JDK FIPS providers. On s390x with IBM Semeru, the FIPS-compliant path is PKCS12 with `IBMJCEPlusFIPS`.
+    4. **IBM Semeru 17 as default JDK** — IBM Semeru Runtime 17 (OpenJ9) provides native s390x optimization, CPACF integration for hardware-accelerated crypto, and built-in IBM FIPS providers with full Kafka compatibility.
+    5. **Cipher suite handling** — Cipher suites are left at JDK defaults unless the deployment involves cross-architecture clients (x86 clients connecting to s390x brokers), in which case operators must pin an explicit cipher suite list that both JDK vendors support.
+    6. **CPACF is transparent** — CP Assist for Cryptographic Functions accelerates AES, SHA, and other operations at the hardware level without application changes. The platform documents CPACF detection as informational in FIPS validation but does not require it.
+
+    **Consequences:** LinuxONE becomes a first-class deployment model alongside Confluent Cloud, CFK on OpenShift, and CP on RHEL. The s390x FIPS validation path uses IBM providers instead of Bouncy Castle. CEX integration is scoped but optional, reducing the barrier to initial adoption on LinuxONE hardware. See [compliance/fips-validation](/compliance/fips-validation) for the full FIPS validation workflow on s390x.
+  </Accordion>
+</AccordionGroup>

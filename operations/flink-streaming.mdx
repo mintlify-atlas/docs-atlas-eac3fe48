@@ -1,0 +1,436 @@
+---
+title: "Apache Flink streaming: SQL templates and deployment"
+description: "Deploy Flink on Confluent Cloud, CFK Kubernetes operator, or Ansible, with FSI SQL templates for windowing, enrichment, and compliance routing."
+---
+
+Apache Flink is the stream processing layer of the FSI Data Streaming Platform, providing stateful SQL-based processing directly over Kafka topics. The platform supports three deployment modes targeting different infrastructure profiles: **CC Flink** (Confluent Cloud managed compute pools provisioned via Terraform), **CFK Flink** (Apache Flink Kubernetes Operator on OpenShift), and **Standalone Flink** (self-managed via Ansible on RHEL). In all three modes, Flink SQL templates reference topics as tables using the CC auto-discovery convention or FlinkDeployment CRD configuration. The reference SQL templates in `reference/flink-sql/` cover the four most common FSI stream processing patterns: tumbling window aggregation, stream-table join enrichment, filter-and-route, and dead letter queue handling.
+
+## Schema Registry auto-discovery
+
+On Confluent Cloud, Flink **auto-discovers** topics that have registered Avro schemas in Schema Registry. Topics appear as queryable tables using this naming convention:
+
+```
+`{environment}`.`{cluster}`.`{topic_name}`
+```
+
+<Warning>
+  Do not use `CREATE TABLE` with connector or format properties for existing CC topics. This is an anti-pattern that creates duplicate resources. CC Flink handles schema mapping automatically when a topic has a registered SR subject.
+</Warning>
+
+Topics provisioned via `modules/topic/` with an Avro schema automatically appear as Flink tables. No additional configuration is required.
+
+## Flink SQL templates
+
+### Tumbling window aggregation
+
+Produces a continuous 1-minute summary of transaction counts, totals, and averages into an output topic for real-time dashboards and alerting.
+
+```sql
+INSERT INTO `corebanking`.`analytics`.`v1`.`txn-volume-1m`
+SELECT
+  window_start,
+  window_end,
+  COUNT(*) AS transaction_count,
+  SUM(amount) AS total_amount,
+  AVG(amount) AS avg_amount,
+  MIN(amount) AS min_amount,
+  MAX(amount) AS max_amount
+FROM TUMBLE(
+  TABLE `corebanking`.`transactions`.`v1`.`account-transaction`,
+  DESCRIPTOR($rowtime),
+  INTERVAL '1' MINUTE
+)
+GROUP BY window_start, window_end;
+```
+
+**Key SQL:** `TUMBLE(TABLE source, DESCRIPTOR($rowtime), INTERVAL '1' MINUTE)`
+
+Prerequisites: source topic with registered Avro schema; output topic created (or auto-create enabled); Flink compute pool provisioned.
+
+### Stream-table join enrichment
+
+Enriches the real-time transaction stream with customer profile data for fraud detection. Joins an unbounded stream against the latest snapshot of a compacted lookup topic.
+
+```sql
+INSERT INTO `fraud`.`enrichment`.`v1`.`enriched-transaction`
+SELECT
+  txn.transaction_id,
+  txn.account_number,
+  txn.amount,
+  txn.transaction_type,
+  txn.`timestamp`,
+  cust.risk_rating,
+  cust.kyc_status,
+  cust.country_code
+FROM `corebanking`.`transactions`.`v1`.`account-transaction` AS txn
+JOIN `corebanking`.`customers`.`v1`.`customer-profile`
+  FOR SYSTEM_TIME AS OF txn.$rowtime AS cust
+ON txn.account_number = cust.account_number;
+```
+
+**Key SQL:** `JOIN dimension FOR SYSTEM_TIME AS OF stream.$rowtime`
+
+<Note>
+  The lookup (dimension) table must be a compacted topic (`cleanup.policy=compact`) with a primary key. The `JOIN ON` clause must include the primary key. See Pitfall 7 in the Flink research notes.
+</Note>
+
+### Filter-and-route
+
+Routes compliance screening results to separate output topics based on match severity.
+
+```sql
+EXECUTE STATEMENT SET
+BEGIN
+  -- High-severity matches: immediate investigation required
+  INSERT INTO `compliance`.`screening`.`v1`.`high-match`
+  SELECT *
+  FROM `compliance`.`screening`.`v1`.`match-result`
+  WHERE match_score >= 85;
+
+  -- Low-severity matches: batch review queue
+  INSERT INTO `compliance`.`screening`.`v1`.`low-match`
+  SELECT *
+  FROM `compliance`.`screening`.`v1`.`match-result`
+  WHERE match_score < 85;
+END;
+```
+
+**Key SQL:** `EXECUTE STATEMENT SET BEGIN ... END;`
+
+<Note>
+  Always use `EXECUTE STATEMENT SET` when multiple `INSERT INTO` statements read from the same source table. This optimizes shared intermediate results. Running two separate statements against the same source is an anti-pattern that doubles source consumption.
+</Note>
+
+### Avro and Schema Registry integration
+
+CC Flink maps Avro field types to Flink SQL types automatically:
+
+| Avro type | Flink SQL type |
+|---|---|
+| `string` | `STRING` |
+| `int` | `INT` |
+| `long` | `BIGINT` |
+| `float` | `FLOAT` |
+| `double` | `DOUBLE` |
+| `boolean` | `BOOLEAN` |
+| `bytes` | `BYTES` |
+| `enum` | `STRING` (Flink cannot create or evolve Avro enum types) |
+| Logical type `timestamp-millis` | `TIMESTAMP(3)` |
+| Logical type `date` | `DATE` |
+
+The `$rowtime` event-time attribute is automatically available for topics with an Avro schema containing a timestamp field. Use `DESCRIPTOR($rowtime)` in windowing and temporal join expressions.
+
+## Deployment modes
+
+<Tabs>
+  <Tab title="CC Flink (Terraform)">
+
+Confluent Cloud Flink provisions a managed compute pool and submits SQL statements as `confluent_flink_statement` resources. The `modules/flink/` Terraform module wraps both resources.
+
+### Compute pool provisioning
+
+```hcl
+module "flink" {
+  source = "../../modules/flink"
+
+  compute_pool_name          = "fsi-prod-pool"
+  cloud_provider             = "AWS"
+  region                     = "us-east-1"
+  max_cfu                    = 10
+  environment_id             = var.environment_id
+  environment_display_name   = var.environment_display_name
+  organization_id            = var.organization_id
+  kafka_cluster_display_name = var.kafka_cluster_display_name
+  flink_service_account_id   = var.flink_service_account_id
+  flink_rest_endpoint        = var.flink_rest_endpoint
+  flink_api_key              = var.flink_api_key
+  flink_api_secret           = var.flink_api_secret
+}
+```
+
+<Warning>
+  `max_cfu` cannot be decreased after compute pool creation. Start conservative: 5–10 CFU for development, 10–20 for staging, 20–50 for production. Valid values: `5`, `10`, `20`, `30`, `40`, `50`.
+</Warning>
+
+The module sets `prevent_destroy = true` on both the compute pool and all statements. This protects running production jobs from accidental `terraform destroy`.
+
+### Submitting SQL statements via Terraform
+
+```hcl
+module "flink" {
+  source = "../../modules/flink"
+  # ... compute pool config ...
+
+  flink_statements = {
+    "txn-volume-1m" = {
+      sql = file("../../reference/flink-sql/tumbling-window-aggregation.sql")
+    }
+    "fraud-enrichment" = {
+      sql        = file("../../reference/flink-sql/stream-table-join-enrichment.sql")
+      properties = {
+        "execution.runtime-mode" = "STREAMING"
+      }
+    }
+  }
+}
+```
+
+Each statement in the `flink_statements` map becomes a `confluent_flink_statement` resource. The module automatically sets `sql.current-catalog` to the environment display name and `sql.current-database` to the Kafka cluster display name.
+
+### Module variables reference
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `compute_pool_name` | string | (required) | Display name; 3–63 chars, alphanumeric with hyphens |
+| `cloud_provider` | string | (required) | `AWS`, `AZURE`, or `GCP` |
+| `region` | string | (required) | Cloud region (e.g., `us-east-1`) |
+| `max_cfu` | number | `5` | Max CFUs; cannot be decreased after creation |
+| `environment_id` | string | (required) | CC environment ID (e.g., `env-xxxxx`) |
+| `flink_statements` | map | `{}` | Map of SQL statements to submit |
+| `flink_service_account_id` | string | `""` | Service account as Flink principal |
+| `flink_api_key` | string (sensitive) | `""` | Flink REST API key |
+| `flink_api_secret` | string (sensitive) | `""` | Flink REST API secret |
+| `prevent_destroy` | bool | `true` | Prevent accidental destruction |
+
+  </Tab>
+
+  <Tab title="CFK Flink (Kubernetes operator)">
+
+For CFK on OpenShift, Flink is deployed via the Apache Flink Kubernetes Operator (version 1.14.0). The operator manages `FlinkDeployment` and `FlinkSessionJob` CRDs in the `flink` namespace.
+
+### Operator installation
+
+```bash
+helm repo add flink-operator \
+  https://archive.apache.org/dist/flink/flink-kubernetes-operator-1.14.0/
+
+helm install flink-kubernetes-operator \
+  flink-operator/flink-kubernetes-operator \
+  --namespace flink --create-namespace \
+  -f scenarios/cfk-openshift/flink/flink-operator-values.yaml
+```
+
+The Helm values configure:
+- Prometheus metrics on port `9249`
+- Admission webhook for `FlinkDeployment` validation
+- RBAC for the operator service account
+- Default Flink configuration applied to all deployments (hashmap state backend, 60-second checkpoint interval)
+
+### Session cluster deployment
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fsi-sql-session
+  namespace: flink
+  labels:
+    app.kubernetes.io/component: flink-session
+    fsi.domain: platform
+spec:
+  image: fsi-flink:1.20
+  flinkVersion: v1_20
+  serviceAccount: flink
+
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+    state.backend: hashmap
+    state.checkpoints.dir: file:///flink-data/checkpoints
+    execution.checkpointing.interval: "60000"
+
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+    replicas: 2
+
+  mode: native
+```
+
+Apply the session cluster:
+
+```bash
+kubectl apply -f scenarios/cfk-openshift/flink/flink-session-cluster.yaml -n flink
+```
+
+### Submitting SQL via the Flink SQL client
+
+```bash
+# Exec into the session cluster
+kubectl exec -it deploy/fsi-sql-session -n flink \
+  -- /opt/flink/bin/sql-client.sh
+
+# Inside sql-client, paste or load SQL templates
+```
+
+### Kafka connector configuration for CFK Flink
+
+For CFK Flink connecting to a Confluent Platform Kafka cluster (non-CC), configure the Kafka connector in the SQL statement or via table properties:
+
+```sql
+CREATE TABLE transactions (
+  transaction_id STRING,
+  account_number STRING,
+  amount DOUBLE,
+  `timestamp` TIMESTAMP(3),
+  WATERMARK FOR `timestamp` AS `timestamp` - INTERVAL '5' SECOND
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'corebanking.transactions.v1.account-transaction',
+  'properties.bootstrap.servers' = 'kafka.confluent.svc.cluster.local:9071',
+  'properties.security.protocol' = 'SASL_SSL',
+  'properties.sasl.mechanism' = 'PLAIN',
+  'properties.sasl.jaas.config' = 'org.apache.flink.kafka.shaded.org.apache.kafka.common.security.plain.PlainLoginModule required username="${kafka_api_key}" password="${kafka_api_secret}";',
+  'format' = 'avro-confluent',
+  'avro-confluent.url' = 'https://schema-registry.confluent.svc.cluster.local:8081'
+);
+```
+
+<Note>
+  CC Flink auto-discovers SR-backed topics without a `CREATE TABLE`. For self-managed CFK Flink connecting to a CP cluster, explicit `CREATE TABLE` with connector properties is required.
+</Note>
+
+### Observability for CFK Flink
+
+The `FlinkDeployment` spec includes a pod template with JMX exporter sidecar configuration. Prometheus scrapes Flink metrics from port `9249` on both JobManager and TaskManager pods. Key metrics:
+
+| Metric | Description |
+|---|---|
+| `flink_taskmanager_job_task_numRecordsInPerSecond` | Input record throughput |
+| `flink_taskmanager_job_task_numRecordsOutPerSecond` | Output record throughput |
+| `flink_jobmanager_job_lastCheckpointDuration` | Checkpoint duration (ms) |
+| `flink_taskmanager_job_task_isBackPressured` | Backpressure indicator |
+
+See [Operations: observability](/operations/observability) for the `dashboard-flink-jobs.json` Grafana dashboard.
+
+  </Tab>
+
+  <Tab title="Standalone Flink (Ansible)">
+
+For Confluent Platform on RHEL deployments not using Kubernetes, Flink runs in standalone session cluster or application mode managed by Ansible.
+
+### Ansible playbook structure
+
+The Flink setup for CP on RHEL uses the `cp_observability` role for metrics and a standalone Flink cluster configuration. Reference the scenario-specific playbooks in `scenarios/cp-rhel/`.
+
+**Standalone session cluster configuration:**
+
+```yaml
+# flink-conf.yaml (deployed to /opt/flink/conf/)
+jobmanager.rpc.address: flink-jobmanager.fsi.internal
+jobmanager.memory.process.size: 2048m
+taskmanager.memory.process.size: 4096m
+taskmanager.numberOfTaskSlots: 4
+
+# Prometheus metrics reporter
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+
+# Kafka connector defaults
+kafka.bootstrap.servers: kafka-east-1:9092,kafka-east-2:9092,kafka-east-3:9092
+
+# State backend
+state.backend: hashmap
+execution.checkpointing.interval: 60000
+```
+
+**Starting the standalone cluster:**
+
+```bash
+# Start JobManager
+/opt/flink/bin/jobmanager.sh start
+
+# Start TaskManagers (run on each TM host)
+/opt/flink/bin/taskmanager.sh start
+
+# Verify cluster is running
+/opt/flink/bin/flink list
+```
+
+**Submitting SQL jobs:**
+
+```bash
+# Submit a SQL script as a Flink job
+/opt/flink/bin/sql-client.sh \
+  -f /opt/flink/sql/tumbling-window-aggregation.sql
+
+# Or use the REST API
+curl -s -X POST http://flink-jobmanager.fsi.internal:8081/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d @job-submission.json
+```
+
+**Kafka connector properties for CP clusters:**
+
+```bash
+# /opt/flink/conf/kafka-connector.properties
+bootstrap.servers=kafka-east-1:9092,kafka-east-2:9092
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+ssl.truststore.location=/etc/kafka/ssl/truststore.jks
+ssl.truststore.password=${truststore_password}
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
+  username="${api_key}" \
+  password="${api_secret}";
+```
+
+**Schema Registry integration:**
+
+```yaml
+# In Flink SQL for CP deployments
+'format' = 'avro-confluent'
+'avro-confluent.url' = 'https://schema-registry.fsi.internal:8081'
+'avro-confluent.basic-auth.credentials-source' = 'USER_INFO'
+'avro-confluent.basic-auth.user-info' = '${sr_api_key}:${sr_api_secret}'
+```
+
+  </Tab>
+</Tabs>
+
+## Common pitfalls
+
+<AccordionGroup>
+  <Accordion title="Do not use DataStream API patterns">
+    CC Flink supports the SQL/Table API only. Apache Flink DataStream API patterns (e.g., `StreamExecutionEnvironment`, `KeyedStream`) are not supported on Confluent Cloud managed Flink.
+  </Accordion>
+
+  <Accordion title="max_cfu cannot be decreased">
+    Once a compute pool is created, `max_cfu` can only be increased, never decreased. Start with the minimum required (5–10 CFU for development, 10–20 for staging) and scale up as needed. Plan capacity before provisioning.
+  </Accordion>
+
+  <Accordion title="Temporal joins require a primary key">
+    The lookup table in a temporal join (`FOR SYSTEM_TIME AS OF`) must be a compacted topic (`cleanup.policy=compact`) with a primary key defined in the table schema. The `JOIN ON` clause must include the primary key column. Without this, the join will fail at submission time.
+  </Accordion>
+
+  <Accordion title="Avro enums are treated as STRING">
+    Flink maps Avro `enum` types to `STRING`. Flink cannot create or evolve Avro enum types. If your schema uses enums, handle them as strings in your SQL logic.
+  </Accordion>
+
+  <Accordion title="Use EXECUTE STATEMENT SET for multiple inserts from the same source">
+    If two or more `INSERT INTO` statements read from the same source table, wrap them in `EXECUTE STATEMENT SET BEGIN ... END;`. Running them as separate statements doubles source topic consumption and creates two independent checkpoints.
+  </Accordion>
+
+  <Accordion title="terraform destroy drops running statements">
+    The `prevent_destroy = true` lifecycle rule on `confluent_flink_statement` resources protects against accidental `terraform destroy` in production. Do not remove this protection without explicit intent and a change window.
+  </Accordion>
+
+  <Accordion title="DLQ requires topic create permissions">
+    The CC Flink DLQ pattern (`error-handling.mode = 'log'`) auto-creates the DLQ topic if it does not exist, but the Flink service account must have topic create permissions. Pre-create DLQ topics via `modules/topic/` for naming governance and SLA tier control.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+- [Reference: Flink module](/reference/flink-module) — full `modules/flink/` variable and output reference
+- [Deployment: Confluent Cloud](/deployment/confluent-cloud) — CC Flink compute pool provisioning
+- [Deployment: CFK on OpenShift](/deployment/cfk-openshift) — Flink Kubernetes Operator setup
+- [Deployment: CP on RHEL](/deployment/cp-rhel) — standalone Flink cluster on RHEL
+- [Governance: schema guide](/governance/schema-guide) — Avro schema requirements for Flink table auto-discovery
+- [Operations: observability](/operations/observability) — Flink job metrics and alert rules

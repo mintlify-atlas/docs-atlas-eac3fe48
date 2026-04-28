@@ -1,0 +1,292 @@
+---
+title: "Schema governance: naming, compatibility, and evolution"
+description: "Naming conventions, compatibility modes by SLA tier, safe evolution procedures, PII tagging, and the breaking-change runbook for FSI Kafka schemas."
+---
+
+Every topic on the FSI Data Streaming Platform uses Apache Avro as its canonical serialization format, registered in Confluent Schema Registry and versioned by subject. The topic module enforces a compatibility mode on each subject automatically based on the topic's SLA tier — teams cannot register a schema that violates the compatibility constraint without going through the breaking-change runbook. Alation catalog descriptions are populated directly from the `doc` annotation on every Avro field, so schema quality directly affects data discoverability.
+
+## Topic naming convention
+
+Topic names follow the four-segment format: `{domain}.{application}.{version}.{entity}`
+
+Each segment is validated by the Terraform module before `terraform plan` succeeds. The validation rules are the source of truth; the table below documents the constraints:
+
+| Segment | Pattern | Example |
+|---|---|---|
+| `domain` | `^[a-z][a-z0-9-]{1,30}$` | `cncb`, `rtfd`, `ofac`, `eventgrid` |
+| `application` | `^[a-z][a-z0-9-]{1,30}$` | `core`, `alerts`, `screening`, `api` |
+| `version` | `^v[0-9]+$` | `v1`, `v2` |
+| `entity` | `^[a-z][a-z0-9-]{1,60}$` | `account-transaction`, `fraud-signal` |
+
+Full example: `cncb.core.v1.account-transaction`
+
+The schema subject name follows the TopicNameStrategy and is computed automatically by the module: `{topic_name}-value`.
+
+## Compatibility modes by SLA tier
+
+The module derives the schema compatibility mode from the topic's SLA tier. This means teams choosing `critical` cannot register schemas with breaking changes without following the versioned-topic runbook below.
+
+| SLA tier | Compatibility mode | What it enforces |
+|---|---|---|
+| `critical` | `FULL_TRANSITIVE` | Can only add optional fields with defaults. Cannot remove, rename, or change the type of any field. All historical versions must read all future versions, and vice versa. |
+| `standard` | `BACKWARD_TRANSITIVE` | New schema versions must be able to read data written by any older version. Adding optional fields is safe. Cannot remove required fields. |
+| `best-effort` | `BACKWARD` | New schema version must read data written by the immediately preceding version only. Adding optional fields is safe. |
+| `compliance` | `FULL_TRANSITIVE` | Same constraint as `critical`. Audit integrity requires that retained data is always deserializable. |
+
+Use `compatibility_override` in the module call only for documented exceptions. Every override must be accompanied by an ADR entry.
+
+## Schema evolution procedures
+
+<Tabs>
+  <Tab title="Adding a field">
+    Adding a field is safe for all compatibility modes when the new field has a default value. Schema Registry will accept the new version without requiring a compatibility override.
+
+    **Pattern:** use a union type with `null` as the first variant and `"default": null`.
+
+    ```json
+    {
+      "name": "new_field",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Description of what this field contains."
+    }
+    ```
+
+    **Deployment order matters for FULL_TRANSITIVE topics:**
+
+    1. Register the new schema version via `terraform apply`.
+    2. Deploy consumers first — they can handle both old messages (field absent) and new messages (field present).
+    3. Deploy producers after all consumers are updated.
+
+    Reversing the deployment order means consumers receiving new messages will encounter an unrecognized field before they have been updated to handle it.
+  </Tab>
+
+  <Tab title="Deprecating a field">
+    `FULL_TRANSITIVE` topics (critical and compliance tiers) do not allow field removal. The correct pattern is soft deprecation:
+
+    1. Stop producing values for the field — set it to `null` or its default value.
+    2. Add a `@deprecated` annotation in the field's `doc` string:
+       ```json
+       {
+         "name": "legacy_field",
+         "type": ["null", "string"],
+         "default": null,
+         "doc": "@deprecated — No longer produced as of 2025-Q2. Will be removed in v2."
+       }
+       ```
+    3. Update consumers to stop reading the field and treat any value as a no-op.
+    4. Track the deprecation in the Terraform module PR. Set a target decommission date (at minimum, one sprint after all consumers confirm they have stopped reading the field).
+
+    For `BACKWARD_TRANSITIVE` topics (standard tier), field removal is technically allowed once all consumers are updated, but the soft-deprecation pattern is still recommended for audit traceability.
+  </Tab>
+
+  <Tab title="Breaking changes">
+    A breaking change is any change that violates the topic's compatibility mode: field removal, type change, field rename, or enum value removal on a `FULL_TRANSITIVE` topic.
+
+    The only supported path for breaking changes is to create a new versioned topic. Do not request a `compatibility_override` for a production breaking change — that path is reserved for exceptional circumstances and requires an ADR.
+
+    Follow the five-step breaking change runbook described in the next section.
+  </Tab>
+</Tabs>
+
+## Breaking change runbook
+
+When you must make an incompatible schema change on a topic with `FULL_TRANSITIVE` or `BACKWARD_TRANSITIVE` compatibility, follow this five-step process. Do not request a `compatibility_override` unless you have exhausted this process and documented the exception in an ADR.
+
+<Steps>
+  <Step title="Create a versioned topic">
+    Create a new topic with the incremented version number using the same Terraform module. Both topics coexist — the original topic continues to operate normally during migration.
+
+    ```hcl
+    module "corebanking_account_txn_v2" {
+      source         = "../../modules/topic"
+      domain         = "corebanking"
+      application    = "transactions"
+      schema_version = "v2"                   # Incremented from v1
+      entity         = "account-transaction"
+      owner          = "core-banking-team@company.com"
+      sla_tier       = "critical"
+      schema_file    = "../../schemas/corebanking/account-transaction-v2.avsc"
+      # Remaining config identical to v1
+    }
+    ```
+  </Step>
+
+  <Step title="Run a dual-write period">
+    Deploy producers that write to both v1 and v2 topics simultaneously.
+
+    - **Minimum duration:** 2 business days to allow consumer teams to plan and begin migration.
+    - **Recommended:** 1 sprint (2 weeks) for critical-tier topics.
+    - **Monitoring:** Verify the v2 topic is receiving messages at expected throughput by watching consumer lag metrics.
+
+    Track the consumer migration checklist in the PR that added the v2 topic:
+
+    ```
+    - [ ] Consumer team A migrated (confirmed YYYY-MM-DD)
+    - [ ] Consumer team B migrated (confirmed YYYY-MM-DD)
+    ```
+  </Step>
+
+  <Step title="Migrate consumers">
+    Each consumer team:
+
+    1. Updates their consumer to read from the v2 topic.
+    2. Deploys to staging and validates deserialization with the new schema.
+    3. Deploys to production.
+    4. Confirms migration is complete by commenting on the PR or updating the intake issue.
+  </Step>
+
+  <Step title="Deprecate the old topic">
+    After **all** consumers confirm migration:
+
+    1. Stop producing to the v1 topic — remove it from the producer configuration.
+    2. Add `deprecated = true` to the v1 module's metadata.
+    3. Set a decommission date: retention period plus 30 days buffer.
+    4. Announce the deprecation via the `#kafka-cop` Teams channel and any relevant team channels.
+  </Step>
+
+  <Step title="Decommission">
+    After the decommission date:
+
+    1. Verify the v1 consumer lag is 0 — no active consumers remain.
+    2. Remove the v1 topic module from the Terraform configuration.
+    3. Run `terraform apply` to delete the topic along with its RBAC bindings and schema resources.
+    4. Optionally soft-delete the v1 schema subject to preserve version history for audit purposes:
+
+    ```bash
+    confluent schema-registry subject delete \
+      --subject "corebanking.transactions.v1.account-transaction-value" \
+      --permanent=false
+    ```
+  </Step>
+</Steps>
+
+## Avro best practices
+
+- Use `["null", "type"]` union with `"default": null` for all optional fields. This is required to add the field safely on `FULL_TRANSITIVE` and `BACKWARD_TRANSITIVE` topics.
+- Use logical types for domain-specific values: `timestamp-millis` for timestamps, `decimal` for monetary amounts, `date` for calendar dates.
+- Use enums for closed value sets such as transaction types, risk categories, and channel codes. Enums communicate domain intent clearly and allow producers and consumers to validate values at the serialization layer.
+- Use `string` for all identifiers — UUIDs, account numbers, member IDs. Never use `long` for identifiers; numeric identifiers are fragile and do not compose well with external systems.
+- Set a `"doc"` annotation on every field. Field documentation is sourced directly into the Alation data catalog. Fields without documentation are flagged in schema CI validation.
+
+## Schema examples
+
+<Tabs>
+  <Tab title="account-transaction">
+    A critical-tier topic carrying core banking transactions. Note the PII field annotations and use of logical types for the monetary amount and timestamp.
+
+    ```json
+    {
+      "type": "record",
+      "name": "AccountTransaction",
+      "namespace": "org.fsi.cncb.core.v1",
+      "doc": "Financial transaction on a member account.",
+      "fields": [
+        {"name": "transaction_id", "type": "string"},
+        {"name": "account_number", "type": "string", "doc": "PII"},
+        {"name": "member_id", "type": "string"},
+        {"name": "member_name", "type": ["null", "string"], "default": null, "doc": "PII"},
+        {"name": "ssn_last4", "type": ["null", "string"], "default": null, "doc": "PII"},
+        {"name": "transaction_type", "type": {
+          "type": "enum",
+          "name": "TransactionType",
+          "symbols": ["DEBIT", "CREDIT", "TRANSFER", "FEE", "INTEREST", "REVERSAL"]
+        }},
+        {"name": "amount", "type": {
+          "type": "bytes",
+          "logicalType": "decimal",
+          "precision": 15,
+          "scale": 2
+        }},
+        {"name": "currency", "type": "string", "default": "USD"},
+        {"name": "description", "type": ["null", "string"], "default": null},
+        {"name": "merchant_name", "type": ["null", "string"], "default": null},
+        {"name": "channel", "type": {
+          "type": "enum",
+          "name": "Channel",
+          "symbols": ["ATM", "POS", "ONLINE", "MOBILE", "BRANCH", "ACH", "WIRE", "INTERNAL"]
+        }},
+        {"name": "timestamp", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+        {"name": "source_system", "type": "string"}
+      ]
+    }
+    ```
+  </Tab>
+
+  <Tab title="fraud-alert-signal">
+    A standard-tier topic for real-time fraud detection alerts. Demonstrates the enum pattern for risk categories and recommended actions.
+
+    ```json
+    {
+      "type": "record",
+      "name": "FraudSignal",
+      "namespace": "org.fsi.rtfd.alerts.v1",
+      "doc": "Real-time fraud detection alert.",
+      "fields": [
+        {"name": "signal_id", "type": "string"},
+        {"name": "transaction_id", "type": "string"},
+        {"name": "member_id", "type": "string", "doc": "PII"},
+        {"name": "account_number", "type": "string", "doc": "PII"},
+        {"name": "fraud_score", "type": "double"},
+        {"name": "model_version", "type": "string"},
+        {"name": "risk_category", "type": {
+          "type": "enum",
+          "name": "RiskCategory",
+          "symbols": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        }},
+        {"name": "signals", "type": {"type": "array", "items": "string"}},
+        {"name": "recommended_action", "type": {
+          "type": "enum",
+          "name": "Action",
+          "symbols": ["ALLOW", "CHALLENGE", "BLOCK", "REVIEW"]
+        }},
+        {"name": "timestamp", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+      ]
+    }
+    ```
+  </Tab>
+
+  <Tab title="compliance-match-result">
+    A compliance-tier topic carrying OFAC screening results. Uses `FULL_TRANSITIVE` compatibility and `timestamp-millis` for the screening event time.
+
+    ```json
+    {
+      "type": "record",
+      "name": "OfacMatchResult",
+      "namespace": "org.fsi.ofac.screening.v1",
+      "fields": [
+        {"name": "screening_id", "type": "string"},
+        {"name": "member_id", "type": "string"},
+        {"name": "member_name", "type": "string", "doc": "PII"},
+        {"name": "matched_name", "type": ["null", "string"], "default": null, "doc": "PII"},
+        {"name": "match_score", "type": "double"},
+        {"name": "list_type", "type": "string"},
+        {"name": "disposition", "type": {
+          "type": "enum",
+          "name": "Disposition",
+          "symbols": ["CLEAR", "REVIEW", "BLOCK"]
+        }},
+        {"name": "screened_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## PII tagging
+
+Fields containing personally identifiable information must be declared in two places:
+
+1. **In the Avro schema:** add `"doc": "PII"` to the field definition. This annotation is the signal used by data catalog tooling and compliance scans to identify PII fields in Schema Registry.
+
+2. **In the Terraform module call:** list the field names in `pii_fields`. The module sets `pii: true` and `pii-fields: field1,field2` in the schema subject metadata, and enables CSFLE encryption rules when `data_classification = confidential`.
+
+```hcl
+module "cncb_account_txn" {
+  # ...
+  pii_fields          = ["member_name", "ssn_last4", "account_number"]
+  data_classification = "internal"   # set to "confidential" to enable CSFLE
+}
+```
+
+For field-level encryption on confidential topics, the module automatically attaches a CEL-based `ENCRYPT` ruleset to the schema subject. This requires the Stream Governance Advanced package on Confluent Cloud. See [Security and RBAC](/governance/security-rbac) for the full CSFLE configuration.

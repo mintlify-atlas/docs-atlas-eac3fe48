@@ -1,0 +1,306 @@
+---
+title: "Deploy Confluent Platform on RHEL with Ansible"
+description: "Ansible deployment of Confluent Platform 7.6 on RHEL 8/9 with MDS RBAC, mTLS, systemd, and standalone Flink for bare-metal FSI environments."
+---
+
+The `scenarios/cp-rhel/` scenario deploys Confluent Platform 7.6.0 on RHEL 8.x or 9.x using the `confluent.platform` cp-ansible collection. Ansible orchestrates the full lifecycle: broker installation and systemd service registration, Schema Registry HA configuration, distributed Kafka Connect workers, MDS RBAC with LDAP identity backend, and mutual TLS across all components. Topic governance uses the `CPTopic` YAML format — the same governance labels (`fsi.sla-tier`, `fsi.domain`, `fsi.owner`) as CFK `KafkaTopic` CRDs and Confluent Cloud Terraform modules, ensuring deployment-model parity. Open-source Apache Flink 1.20 is deployed via a standalone Ansible role with systemd management, because Confluent Platform Flink requires Kubernetes.
+
+## Prerequisites
+
+- RHEL 8.x or 9.x on all target hosts
+- Ansible 9.x (core 2.16+) on the control node
+- Java 17 JDK on all target hosts
+- `cp-ansible` 7.6.x collection installed
+- SSH connectivity from the control node to all target hosts
+- DNS or `/etc/hosts` entries for all cluster nodes
+- (Optional) HashiCorp Vault for secret management
+- (Optional) LDAP/AD backend for MDS RBAC identity resolution
+
+## Cluster topology
+
+The scenario deploys the following components in a single data center (East):
+
+| Component | Nodes | Purpose |
+|---|---|---|
+| Kafka Brokers | 3 | Multi-rack brokers with Confluent Server, MDS co-located |
+| Schema Registry | 2 | HA Schema Registry with TLS |
+| Kafka Connect | 2 | Distributed Connect workers with JDBC plugin path |
+| Flink JobManager | 1 | Coordinates Flink job execution, serves REST UI on port 8085 |
+| Flink TaskManagers | 2 | Execute task slots for parallel stream processing |
+
+Brokers are distributed across three availability zones (`us-east-1a`, `us-east-1b`, `us-east-1c`) via `broker.rack` configuration, ensuring partition replicas are spread across racks for fault tolerance.
+
+## Deployment steps
+
+<Steps>
+  <Step title="Install the cp-ansible collection">
+
+    ```bash
+    ansible-galaxy collection install confluent.platform
+    ```
+
+  </Step>
+  <Step title="Copy and customize the inventory">
+
+    ```bash
+    cd scenarios/cp-rhel/
+    cp inventory/hosts.yml.example inventory/hosts.yml
+    ```
+
+    Edit `inventory/hosts.yml` with your actual hostnames, IP addresses, and broker rack assignments:
+
+    ```yaml
+    all:
+      vars:
+        ansible_connection: ssh
+        ansible_user: confluent
+        ansible_become: true
+        confluent_server_enabled: true
+        confluent_package_version: "7.6.0"
+      children:
+        kafka_broker:
+          hosts:
+            kafka-east-1:
+              ansible_host: 10.0.1.11
+              kafka_broker_custom_properties:
+                broker.id: 1
+                broker.rack: us-east-1a
+            kafka-east-2:
+              ansible_host: 10.0.1.12
+              kafka_broker_custom_properties:
+                broker.id: 2
+                broker.rack: us-east-1b
+            kafka-east-3:
+              ansible_host: 10.0.1.13
+              kafka_broker_custom_properties:
+                broker.id: 3
+                broker.rack: us-east-1c
+        schema_registry:
+          hosts:
+            sr-east-1:
+              ansible_host: 10.0.2.11
+            sr-east-2:
+              ansible_host: 10.0.2.12
+        kafka_connect:
+          hosts:
+            connect-east-1:
+              ansible_host: 10.0.3.11
+            connect-east-2:
+              ansible_host: 10.0.3.12
+        flink_jobmanager:
+          hosts:
+            flink-jm-1: {}
+        flink_taskmanager:
+          hosts:
+            flink-tm-1: {}
+            flink-tm-2: {}
+    ```
+
+  </Step>
+  <Step title="Store secrets in Ansible Vault">
+
+    Store sensitive values (MDS passwords, LDAP credentials, TLS keystores) in Ansible Vault:
+
+    ```bash
+    ansible-vault create inventory/group_vars/vault.yml
+    ```
+
+    The `inventory/group_vars/all.yml` references vault variables for MDS and component service accounts:
+
+    ```yaml
+    mds_super_user_password: "{{ vault_mds_password }}"
+    kafka_broker_ldap_password: "{{ vault_kafka_broker_password }}"
+    schema_registry_ldap_password: "{{ vault_sr_password }}"
+    kafka_connect_ldap_password: "{{ vault_connect_password }}"
+    ```
+
+  </Step>
+  <Step title="Run the deployment playbook">
+
+    Deploy the full CP stack:
+
+    ```bash
+    ansible-playbook -i inventory/hosts.yml playbooks/deploy-cp.yml
+    ```
+
+    With Ansible Vault for secrets:
+
+    ```bash
+    ansible-playbook -i inventory/hosts.yml playbooks/deploy-cp.yml --ask-vault-pass
+    ```
+
+  </Step>
+  <Step title="Deploy standalone Flink (optional)">
+
+    ```bash
+    ansible-playbook -i inventory/hosts.yml playbooks/deploy-flink.yml
+    ```
+
+  </Step>
+</Steps>
+
+## Ansible roles
+
+Ten roles provide full lifecycle management. The table below covers all roles relevant to CP on RHEL deployments:
+
+| Role | Purpose |
+|---|---|
+| `cp_topic` | Topic CRUD via Admin REST v3 with SLA-tier governance enforcement |
+| `cp_schema` | Avro schema registration with two-pass compatibility safety check |
+| `cp_rbac` | MDS RBAC binding lifecycle with LIST/DIFF/ADD/REMOVE reconciliation |
+| `cp_connect` | Connector lifecycle via idempotent PUT REST API |
+| `cp_observability` | JMX exporter, Prometheus `file_sd`, Grafana dashboards, SLA-tier alerts |
+| `cp_dr_mm2` | MM2 failover/failback with Consul flip and state validation |
+| `cp_dr_mrc` | MRC observer promotion for RPO=0 scenarios |
+| `cp_mtls` | mTLS certificate provisioning (CA, broker/client keystores, truststores) |
+
+All roles support `--check` mode for audit-ready dry runs.
+
+## Site.yml orchestration
+
+`ansible/site.yml` is the end-to-end orchestration pipeline. Use tags for selective execution:
+
+```bash
+# Full stack: cluster + topics + schemas + RBAC + connectors + observability
+ansible-playbook site.yml
+
+# Topic governance only
+ansible-playbook site.yml --tags topics
+
+# RBAC bindings only
+ansible-playbook site.yml --tags rbac
+
+# Schema registration only
+ansible-playbook site.yml --tags schemas
+
+# Observability setup only
+ansible-playbook site.yml --tags observability
+
+# Dry-run / audit mode (no changes applied)
+ansible-playbook site.yml --check
+```
+
+## Security configuration
+
+The `inventory/group_vars/all.yml` file controls security settings applied to every host:
+
+```yaml
+# TLS -- mutual auth enabled
+ssl_enabled: true
+ssl_mutual_auth_enabled: true
+
+# MDS RBAC
+rbac_enabled: true
+mds_super_user: mds
+mds_super_user_password: "{{ vault_mds_password }}"
+
+# FIPS -- toggle for FIPS 140-2 compliance
+fips_enabled: false
+fips_mode: "fips-140-2"
+
+# JMX exporter for observability
+jmxexporter_enabled: true
+```
+
+### TLS
+
+Mutual TLS is enabled by default (`ssl_mutual_auth_enabled: true`). The `cp_mtls` role automates the full certificate lifecycle — CA generation, broker keystores, client keystores, and truststore distribution. Use custom CA-signed certificates for production:
+
+```yaml
+ssl_custom_certs: true
+ssl_ca_cert_filepath: "/etc/ssl/certs/fsi-ca.pem"
+ssl_signed_cert_filepath: "/etc/ssl/certs/{{ inventory_hostname }}.pem"
+ssl_key_filepath: "/etc/ssl/private/{{ inventory_hostname }}-key.pem"
+```
+
+### MDS RBAC
+
+Confluent RBAC via the Metadata Service (MDS) requires an LDAP/AD backend for identity resolution. Configure the LDAP connection in `inventory/group_vars/all.yml`:
+
+```yaml
+# mds_ldap_search_base: "dc=fsi,dc=org"
+# mds_ldap_server_url: "ldaps://ldap.fsi.org:636"
+# mds_ldap_user_search_filter: "(uid={0})"
+```
+
+## Topic governance
+
+Topic definitions use the `CPTopic` YAML format in `topics/`. These files carry the same FSI governance labels as `KafkaTopic` CRDs and Confluent Cloud Terraform topic modules:
+
+- `fsi.sla-tier` — SLA tier (`critical`, `standard`, `best-effort`, `compliance`)
+- `fsi.domain` — Business domain
+- `fsi.owner` — Team email responsible for the topic
+- `fsi.data-classification` — Data classification per FSI policy
+- `fsi.application` — Application name within the domain
+- `fsi.version` — Schema version identifier
+- `fsi.entity` — Data entity name
+
+CPTopic YAML files are validated by `ci/scripts/c4e-precheck.py` on every PR to enforce naming conventions and governance labels before deployment.
+
+## Flink SQL with Schema Registry
+
+Standalone Flink uses the `flink-sql-avro-confluent-3.2.0-1.20` connector JAR installed in `$FLINK_HOME/lib/`. Use explicit `CREATE TABLE` DDL with `FORMAT = 'avro-confluent'`:
+
+```sql
+CREATE TABLE my_table (
+  transaction_id STRING,
+  account_number STRING,
+  amount DOUBLE
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'corebanking.transactions.v1.account-transaction',
+  'properties.bootstrap.servers' = 'kafka-east-1:9092',
+  'format' = 'avro-confluent',
+  'avro-confluent.url' = 'https://sr-east-1:8081'
+);
+```
+
+Flink REST UI is available on port 8085. JMX metrics are exposed on port 9999.
+
+## Systemd service management
+
+All CP components are managed via systemd units installed by cp-ansible:
+
+```bash
+# Check service status
+systemctl status confluent-kafka
+systemctl status confluent-schema-registry
+systemctl status confluent-kafka-connect
+
+# Restart a service
+systemctl restart confluent-kafka
+```
+
+## Operational notes
+
+<AccordionGroup>
+  <Accordion title="Network ports">
+    Ensure firewall rules allow the following ports between all cluster nodes: Kafka (9092–9093), Schema Registry (8081), Connect (8083), MDS (8090), JMX exporter (7778), Flink REST (8085), Flink JMX (9999).
+  </Accordion>
+  <Accordion title="Storage">
+    Kafka log directories should be on dedicated high-throughput storage (SSD/NVMe recommended). Configure `log.dirs` in `inventory/group_vars/kafka_broker.yml` for multi-disk setups.
+  </Accordion>
+  <Accordion title="Disaster recovery">
+    CP on RHEL supports both Cluster Linking and Multi-Region Clusters (MRC). MRC with observer promotion provides RPO=0 for compliance-tier topics. Use the `cp_dr_mm2` role for MirrorMaker 2 failover or `cp_dr_mrc` for MRC observer promotion. See the DR runbook for step-by-step procedures.
+  </Accordion>
+  <Accordion title="Observability">
+    JMX exporter is enabled by default (`jmxexporter_enabled: true`) and scrapes on port 7778. Point your Prometheus scrape targets at port 7778 on each CP node. Dashboard templates for Grafana, Dynatrace, Datadog, Splunk, New Relic, and IBM Instana are in the platform `observability/` directory.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Ansible roles reference" href="/reference/ansible-roles">
+    Full documentation for all ten Ansible roles including variable reference and examples.
+  </Card>
+  <Card title="DR runbook" href="/operations/dr-runbook">
+    MM2 failover and MRC observer promotion procedures with Ansible playbook operations.
+  </Card>
+  <Card title="Deploy on LinuxONE" href="/deployment/linuxone">
+    CP on RHEL on IBM LinuxONE s390x with FIPS 140-2 and CEX/HSM key management.
+  </Card>
+  <Card title="RBAC and security" href="/governance/security-rbac">
+    MDS RBAC role binding patterns and service account design for CP deployments.
+  </Card>
+</CardGroup>

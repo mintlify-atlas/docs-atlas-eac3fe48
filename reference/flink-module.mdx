@@ -1,0 +1,161 @@
+---
+title: "Flink module reference: compute pools and SQL statements"
+description: "Complete reference for the FSI Kafka Platform Flink Terraform module — compute pool sizing, SQL statement lifecycle, and all input and output variables."
+---
+
+The `modules/flink` Terraform module provisions a Confluent Cloud Flink compute pool and optionally submits Flink SQL statements as managed Terraform resources. Confluent Cloud Flink auto-discovers Schema Registry subjects for topics with registered Avro schemas, which means SQL statements can reference topics as tables without writing `CREATE TABLE` definitions by hand. The module is intentionally conservative about lifecycle management: `prevent_destroy` defaults to `true` on both the compute pool and all submitted statements to guard against accidental destruction of running production jobs.
+
+## Deployment modes
+
+The FSI Data Streaming Platform supports three Flink deployment models. This module targets the Confluent Cloud managed model.
+
+| Mode | Description |
+|---|---|
+| **Confluent Cloud (CC)** | Fully managed Flink on Confluent Cloud. This module provisions CC compute pools and SQL statements via the Confluent Terraform provider. No infrastructure to manage. |
+| **Confluent for Kubernetes (CFK)** | Flink on OpenShift or vanilla Kubernetes via the CFK operator. Deployed through the `cfk_operator` Ansible role and Kubernetes CRDs. See [CFK on OpenShift](/deployment/cfk-openshift). |
+| **Standalone** | Self-managed Apache Flink on RHEL. Deployed and configured separately from this module. See [Confluent Platform on RHEL](/deployment/cp-rhel). |
+
+For operational guidance on all three modes, see [Flink streaming operations](/operations/flink-streaming).
+
+## Example module call
+
+```hcl
+module "flink" {
+  source = "../../modules/flink"
+
+  compute_pool_name          = "fsi-prod-pool"
+  cloud_provider             = "AWS"
+  region                     = "us-east-1"
+  max_cfu                    = 10
+  environment_id             = var.environment_id
+  environment_display_name   = var.environment_display_name
+  organization_id            = var.organization_id
+  kafka_cluster_display_name = var.kafka_cluster_display_name
+
+  flink_service_account_id = var.flink_service_account_id
+  flink_rest_endpoint       = var.flink_rest_endpoint
+  flink_api_key             = var.flink_api_key
+  flink_api_secret          = var.flink_api_secret
+
+  flink_statements = {
+    "fraud-enrichment" = {
+      sql = "INSERT INTO cncb.core.v1.fraud-signal SELECT ..."
+      properties = {
+        "sql.local-time-zone" = "UTC"
+      }
+    }
+  }
+}
+```
+
+## Compute pool sizing
+
+The compute pool `max_cfu` setting controls the maximum number of Confluent Flink Units available to all statements running in the pool. CFUs cannot be decreased after pool creation — plan conservatively and scale up rather than down.
+
+| Environment | Recommended `max_cfu` |
+|---|---|
+| Development | 5 |
+| Staging | 10 |
+| Production | 20–50 |
+
+The pool is locked with `prevent_destroy = true` in the module's `lifecycle` block. To resize an existing pool (increase only), update `max_cfu` and apply; Terraform will update in-place. To reduce CFUs, the pool must be destroyed and recreated — coordinate with the C4E before doing this in production.
+
+## SQL statement lifecycle
+
+Each entry in `flink_statements` creates a `confluent_flink_statement` resource. Statements are submitted to the compute pool with the environment display name set as `sql.current-catalog` and the Kafka cluster display name set as `sql.current-database`. Additional per-statement properties can be passed in the `properties` map.
+
+Statements also have `prevent_destroy = true`. Destroying a Terraform-managed statement stops the running Flink job. In production, always use `terraform state rm` to detach a statement from Terraform management before stopping it intentionally, and coordinate through the DR runbook when stopping statements during failover.
+
+## Input variables
+
+### Compute pool configuration
+
+<ParamField path="compute_pool_name" type="string" required>
+  Display name for the Flink compute pool (e.g. `fsi-prod-pool`). Must be 3–63 characters, alphanumeric with hyphens, starting with a letter.
+</ParamField>
+
+<ParamField path="cloud_provider" type="string" required>
+  Cloud provider for the compute pool. Must be one of: `AWS`, `AZURE`, `GCP`.
+</ParamField>
+
+<ParamField path="region" type="string" required>
+  Cloud region for the compute pool (e.g. `us-east-1` for AWS, `eastus2` for Azure, `us-central1` for GCP).
+</ParamField>
+
+<ParamField path="max_cfu" type="number" default="5">
+  Maximum Confluent Flink Units for the pool. Must be one of: `5`, `10`, `20`, `30`, `40`, `50`. **Cannot be decreased after pool creation.** Start conservative and scale up as load is profiled.
+</ParamField>
+
+<ParamField path="environment_id" type="string" required>
+  Confluent Cloud environment ID (e.g. `env-xxxxx`). Must match the environment where the compute pool is provisioned.
+</ParamField>
+
+<ParamField path="environment_display_name" type="string" required>
+  Confluent Cloud environment display name. Used as the `sql.current-catalog` property for all statements submitted to this pool.
+</ParamField>
+
+### Flink SQL statement configuration
+
+<ParamField path="flink_statements" type="map(object)" default="{}">
+  Map of Flink SQL statements to submit. The key becomes the statement name. Each value is an object with:
+
+  - `sql` (string, required) — the Flink SQL text to execute
+  - `properties` (map(string), optional, default `{}`) — additional statement-level properties merged with the catalog/database defaults
+
+  An empty map submits no statements; the compute pool is created and ready for statements submitted outside of Terraform.
+</ParamField>
+
+<ParamField path="organization_id" type="string" required>
+  Confluent Cloud organization ID. Required to scope Flink statement resources.
+</ParamField>
+
+<ParamField path="kafka_cluster_display_name" type="string" required>
+  Kafka cluster display name. Used as the `sql.current-database` property, which determines the default database (cluster) for SQL statement table resolution.
+</ParamField>
+
+<ParamField path="flink_service_account_id" type="string" default='""'>
+  Service account ID used as the principal for submitted Flink statements. This SA requires appropriate RBAC bindings on the topics the SQL statements read from or write to.
+</ParamField>
+
+<ParamField path="flink_rest_endpoint" type="string" default='""'>
+  Flink REST endpoint for the compute pool region. Required to submit statements.
+</ParamField>
+
+<ParamField path="flink_api_key" type="string" default='""'>
+  API key for Flink REST API authentication. Marked sensitive. Can be a Cloud API key or a Flink-scoped key.
+</ParamField>
+
+<ParamField path="flink_api_secret" type="string" default='""'>
+  API secret for Flink REST API authentication. Marked sensitive.
+</ParamField>
+
+### Lifecycle control
+
+<ParamField path="prevent_destroy" type="bool" default="true">
+  When `true`, Terraform will refuse to destroy the compute pool and submitted statements. Set to `false` only in non-production environments where destroy is intentional. In production, use `terraform state rm` to detach resources rather than setting this to `false`.
+</ParamField>
+
+## Outputs
+
+<ResponseField name="compute_pool_id" type="string">
+  Confluent Cloud Flink compute pool resource ID.
+</ResponseField>
+
+<ResponseField name="compute_pool_name" type="string">
+  Display name of the provisioned compute pool.
+</ResponseField>
+
+<ResponseField name="compute_pool_resource_name" type="string">
+  Confluent resource name (CRN) for the compute pool, used for RBAC and audit purposes.
+</ResponseField>
+
+<ResponseField name="statement_names" type="list(string)">
+  List of statement names submitted to the pool. Corresponds to the keys of the `flink_statements` input map.
+</ResponseField>
+
+## Related pages
+
+- [Flink streaming operations](/operations/flink-streaming) — operational guidance for all three Flink deployment modes, including statement monitoring and failure recovery
+- [CFK on OpenShift](/deployment/cfk-openshift) — CFK-based Flink deployment for OpenShift environments
+- [Confluent Platform on RHEL](/deployment/cp-rhel) — standalone Flink deployment on RHEL
+- [Confluent Cloud deployment](/deployment/confluent-cloud) — environment setup prerequisites for this module

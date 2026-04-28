@@ -1,0 +1,118 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "FSI Data Streaming Platform",
+  "projectDescription": "A turnkey, automation-first platform for standing up fully governed Kafka, Flink, and Schema Registry infrastructure across eight deployment models — enabling financial institutions to achieve production-ready, DR-capable streaming in hours.",
+  "theme": "aspen",
+  "primaryColor": "#1E3A5F",
+  "lightColor": "#2E5B9A",
+  "darkColor": "#0F1F35",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "deployment-models"
+            ]
+          },
+          {
+            "group": "Governance",
+            "pages": [
+              "governance/topic-onboarding",
+              "governance/schema-guide",
+              "governance/sla-tiers",
+              "governance/security-rbac"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/confluent-cloud",
+              "deployment/cfk-openshift",
+              "deployment/cp-rhel",
+              "deployment/linuxone"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/dr-runbook",
+              "operations/observability",
+              "operations/credential-rotation",
+              "operations/flink-streaming"
+            ]
+          },
+          {
+            "group": "Compliance",
+            "pages": [
+              "compliance/compliance-guide",
+              "compliance/fips-validation",
+              "compliance/adr-index"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Module Reference",
+            "pages": [
+              "reference/topic-module",
+              "reference/flink-module",
+              "reference/ansible-roles"
+            ]
+          },
+          {
+            "group": "Client Examples",
+            "pages": [
+              "reference/java-client",
+              "reference/python-client",
+              "reference/dotnet-client",
+              "reference/local-dev"
+            ]
+          },
+          {
+            "group": "CI/CD",
+            "pages": [
+              "reference/cicd-pipeline",
+              "reference/dr-cli"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Eight deployment scenarios (Confluent Cloud AWS/Azure/GCP, CFK on OpenShift, CP on RHEL, Private Cloud, LinuxONE variants) with governance parity",
+    "Single Terraform topic module generates topic + Avro schema + RBAC bindings + DR mirror + metadata tags",
+    "SLA-tier system (critical/standard/best-effort/compliance) auto-derives partition count, retention, and schema compatibility",
+    "Three DR backends (Cluster Linking, MirrorMaker 2, Multi-Region Cluster) with unified CLI and Ansible playbooks",
+    "Pre-built observability dashboards for six providers: Dynatrace, Datadog, Splunk, Grafana, New Relic, IBM Instana",
+    "FSI compliance features: FIPS 140-2 validation, CSFLE field-level encryption, up to 7-year retention for OFAC/AML, audit trail CI pipeline",
+    "Consul-based atomic failover for Kafka, Schema Registry, and database endpoints with single KV flip",
+    "Reference client implementations in Java 17, Python, and .NET with DLQ patterns and Avro/SR integration",
+    "C4E pre-check CI pipeline validates topic naming, schema compatibility, RBAC, and SLA tiers across all three config formats",
+    "LinuxONE (s390x) support with FIPS 140-2, mTLS, CEX/HSM hardware security module integration"
+  ],
+  "publicApiSurface": [
+    "modules/topic — Terraform module: domain, application, schema_version, entity, owner, sla_tier, schema_file, pii_fields, producer_service_accounts, consumer_service_accounts",
+    "modules/flink — Terraform module for CC Flink compute pool and SQL statement management",
+    "scripts/fsi-dr.sh — DR CLI: failover, failback, status with --backend cl|mm2|mrc and --dry-run|--force flags",
+    "scripts/validate-fips.sh — FIPS 140-2 compliance validation script",
+    "scripts/validate-apply.sh — Post-apply Terraform validation with compliance audit trail",
+    "ansible/site.yml — End-to-end Ansible orchestration pipeline with tags: topics, schemas, rbac, connect, observability, dr",
+    "ansible/roles/cp_topic — Topic CRUD via Admin REST v3 with SLA-tier governance",
+    "ansible/roles/cp_schema — Avro schema registration with two-pass compatibility safety",
+    "ansible/roles/cp_rbac — MDS RBAC binding lifecycle with LIST/DIFF/ADD/REMOVE reconciliation",
+    "ansible/roles/cp_dr_mm2 — MM2 failover/failback with Consul flip and state validation",
+    "ansible/roles/cp_dr_mrc — MRC observer promotion for RPO=0 scenarios",
+    "FSI_DR_BACKEND env var — Selects DR backend: cluster-linking (default), mm2, mrc",
+    "SLA tier values: critical | standard | best-effort | compliance",
+    "Topic naming convention: {domain}.{application}.{version}.{entity}"
+  ]
+}

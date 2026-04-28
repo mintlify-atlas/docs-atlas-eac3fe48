@@ -1,0 +1,152 @@
+---
+title: "SLA tiers: critical, standard, best-effort, compliance"
+description: "Auto-derived configuration defaults — partitions, retention, schema compatibility, and DR priority — for the four FSI platform SLA tiers."
+---
+
+The FSI Data Streaming Platform uses four SLA tiers to encode governance decisions directly into topic infrastructure. When a team declares `sla_tier = "standard"` in their Terraform module call, the platform automatically configures partition count, retention period, schema compatibility mode, and DR mirror lag thresholds without requiring the team to reason about each setting individually. Overrides are available for documented exceptions, but the defaults represent C4E-reviewed choices for each tier's risk and throughput profile.
+
+## Tier comparison
+
+| | Critical | Standard | Best-effort | Compliance |
+|---|---|---|---|---|
+| **Compatibility mode** | `FULL_TRANSITIVE` | `BACKWARD_TRANSITIVE` | `BACKWARD` | `FULL_TRANSITIVE` |
+| **Partitions** | 12 | 6 | 3 | 12 |
+| **Retention** | 7 days (604,800,000 ms) | 3 days (259,200,000 ms) | 1 day (86,400,000 ms) | Configurable (≥ 7 years or infinite) |
+| **Min in-sync replicas** | 2 | 2 | 1 | 2 |
+| **DR mirror lag warn** | 30 seconds | 5 minutes | 60 minutes | 10 seconds |
+| **DR mirror lag alert** | 60 seconds | 15 minutes | 4 hours | 30 seconds |
+| **DR priority** | Highest | Standard | Best-effort | Highest |
+
+## Tier reference
+
+<AccordionGroup>
+  <Accordion title="critical — core transaction and payment data">
+    The `critical` tier is reserved for topics where data loss or schema incompatibility would directly impact member-facing financial operations. Use it for core banking transactions, payment processing, and real-time fraud decision feeds.
+
+    **Compatibility: `FULL_TRANSITIVE`**
+    All historical schema versions must be able to read data written by all future versions, and vice versa. The only safe evolution is adding optional fields with default values. Field removal and type changes require a new versioned topic.
+
+    **Partitions: 12**
+    Provides parallelism for high-throughput production workloads. Consumer groups can have up to 12 concurrent readers.
+
+    **Retention: 7 days**
+    Sufficient for replay during incident response. Does not satisfy long-term regulatory retention — use the `compliance` tier for that requirement.
+
+    **DR mirror lag thresholds**
+    - Warn at 30 seconds of mirror lag
+    - Alert at 60 seconds of mirror lag
+
+    These thresholds drive pre-failover warnings in the DR automation scripts. Exceeding the alert threshold before a failover means the RPO guarantee may not be met.
+  </Accordion>
+
+  <Accordion title="standard — operational and enrichment data">
+    The `standard` tier covers topics that are important to business operations but can tolerate a short outage or bounded data loss. Use it for enrichment feeds, internal notifications, audit events, and application integration events.
+
+    **Compatibility: `BACKWARD_TRANSITIVE`**
+    New schema versions must be able to read data written by any older version. Adding optional fields is safe. Removing required fields is blocked. Compared to `FULL_TRANSITIVE`, producers can evolve slightly faster because old consumers are not required to read new schema versions.
+
+    **Partitions: 6**
+    Balances parallelism and resource cost for typical operational throughput.
+
+    **Retention: 3 days**
+    Sufficient for short-term replay and consumer catch-up after a brief outage.
+
+    **DR mirror lag thresholds**
+    - Warn at 5 minutes of mirror lag
+    - Alert at 15 minutes of mirror lag
+  </Accordion>
+
+  <Accordion title="best-effort — development, testing, and low-priority feeds">
+    The `best-effort` tier is for non-critical internal feeds, developer testing topics, and low-volume operational data where some loss is acceptable.
+
+    **Compatibility: `BACKWARD`**
+    New schema version must be compatible with the immediately preceding version only. Schema Registry does not check compatibility with older versions. This is the most permissive mode available without a `compatibility_override`.
+
+    **Partitions: 3**
+    Minimal resource footprint for low-volume or ephemeral workloads.
+
+    **Retention: 1 day**
+    Data is not expected to be replayed beyond the current day's processing window.
+
+    **Min in-sync replicas: 1**
+    Unlike other tiers, `best-effort` allows production with a single in-sync replica, accepting a higher risk of data loss under broker failures.
+
+    **DR mirror lag thresholds**
+    - Warn at 60 minutes of mirror lag
+    - Alert at 4 hours of mirror lag
+  </Accordion>
+
+  <Accordion title="compliance — regulatory retention and screening records">
+    The `compliance` tier is for topics that must meet FSI regulatory retention requirements — OFAC/AML screening results, audit trails, and other records subject to multi-year retention mandates. It shares the same throughput and compatibility profile as `critical` but adds configurable long-term retention.
+
+    **Compatibility: `FULL_TRANSITIVE`**
+    Same as `critical`. Schema integrity must be maintained indefinitely so that retained records are always deserializable.
+
+    **Partitions: 12**
+    Same as `critical`.
+
+    **Retention: configurable via `retention_years`**
+    Set `retention_years` in the module call. The module converts years to milliseconds (`retention_years × 31,557,600,000 ms`). Pass `-1` for infinite retention.
+
+    ```hcl
+    module "ofac_screening_result" {
+      source         = "../../modules/topic"
+      sla_tier       = "compliance"
+      retention_years = 7    # 7-year OFAC/AML regulatory requirement
+      # ...
+    }
+    ```
+
+    Validation enforces that `retention_years` is either `-1` (infinite) or `>= 7`. Values below 7 are rejected — FSI regulatory requirements do not permit shorter compliance retention.
+
+    **DR mirror lag thresholds**
+    - Warn at 10 seconds of mirror lag
+    - Alert at 30 seconds of mirror lag
+
+    The tightest thresholds on the platform. Compliance records must be available immediately after failover.
+
+    For full compliance tier requirements including FIPS validation and audit log configuration, see the [compliance guide](/compliance/compliance-guide).
+  </Accordion>
+</AccordionGroup>
+
+## Configuration overrides
+
+All three auto-derived settings can be overridden at the module level. Overrides must be documented — if a team requests a `compatibility_override` on a production topic, C4E will ask for an ADR reference during PR review.
+
+<ParamField path="compatibility_override" type="string" default="null">
+  Override the SLA-tier-derived schema compatibility mode. Accepted values: `BACKWARD`, `BACKWARD_TRANSITIVE`, `FORWARD`, `FORWARD_TRANSITIVE`, `FULL`, `FULL_TRANSITIVE`, `NONE`.
+
+  Leave `null` to use the C4E default for the selected `sla_tier`. Setting `NONE` disables all compatibility checking and is not permitted for production topics without a C4E-approved ADR.
+</ParamField>
+
+<ParamField path="partitions_override" type="number" default="null">
+  Override the SLA-tier-derived partition count. Leave `null` to use the C4E default.
+
+  Valid reasons for an override include unusually high throughput requirements (increase) or cost optimisation for a known-low-volume topic (decrease). Changing partition count after a topic is created requires recreating the topic — plan carefully.
+</ParamField>
+
+<ParamField path="retention_ms_override" type="number" default="null">
+  Override the SLA-tier-derived retention in milliseconds. Leave `null` to use the C4E default.
+
+  For compliance tier topics, prefer `retention_years` instead of this override — `retention_years` enforces the `>= 7` minimum and is more readable for regulatory documentation.
+</ParamField>
+
+## Choosing the right tier
+
+<Tip>
+  Use this decision guide to select your tier:
+
+  - **Member-facing transactions, payments, or real-time decisioning?** → `critical`
+  - **Operational feeds, audit events, application integration?** → `standard`
+  - **Developer testing, low-priority internal data?** → `best-effort`
+  - **OFAC/AML screening results, regulatory audit trails, 7+ year retention?** → `compliance`
+
+  When in doubt, choose `standard`. Upgrading a topic's SLA tier later is a low-risk change (partition and retention increases are non-destructive). Downgrading is harder because it may require reducing partitions or loosening compatibility.
+</Tip>
+
+## Related guides
+
+- [Onboard a new Kafka topic](/governance/topic-onboarding) — the self-service workflow for provisioning a topic
+- [Schema governance](/governance/schema-guide) — compatibility modes explained in detail with evolution procedures
+- [Compliance guide](/compliance/compliance-guide) — OFAC/AML retention, FIPS validation, and audit log requirements for the compliance tier
+- [DR runbook](/operations/dr-runbook) — how mirror lag thresholds are used during failover decisions

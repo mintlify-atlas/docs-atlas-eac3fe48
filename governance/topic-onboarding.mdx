@@ -1,0 +1,147 @@
+---
+title: "Onboard a new Kafka topic: self-service workflow"
+description: "Follow the five-step self-service workflow to request, register a schema, declare RBAC bindings, and verify your new governed Kafka topic."
+---
+
+Every Kafka topic on the FSI Data Streaming Platform is provisioned through a single Terraform module that enforces naming conventions, schema compatibility, RBAC, and disaster-recovery mirroring in one atomic operation. Teams do not interact with Confluent Cloud directly — all topic lifecycle management flows through Git, and the C4E reviews every request before automation applies it. This workflow is designed to keep onboarding predictable: most teams complete their first topic in under a day.
+
+<Note>
+**Prerequisites before you begin:**
+
+- Your team has a Confluent Cloud service account. Request one via the C4E intake process if you do not have one yet.
+- You have write access to the `fsi-kafka-platform` Git repository.
+- Your Avro schema (`.avsc` file) is ready and validated against the naming conventions in [Schema governance](/governance/schema-guide).
+- You know your SLA tier. If you are unsure, consult the [SLA tier guide](/governance/sla-tiers).
+</Note>
+
+## Onboarding workflow
+
+<Steps>
+  <Step title="Fill out the intake form">
+    Copy `.github/ISSUE_TEMPLATE/new-topic-request.md` and open a GitHub Issue in the `fsi-kafka-platform` repository. Fill in every field:
+
+    | Field | Example |
+    |---|---|
+    | Domain | `cncb` |
+    | Application | `core` |
+    | Version | `v1` |
+    | Entity | `account-transaction` |
+    | Owner email | `cncb-team@fsi.org` |
+    | SLA tier | `standard` |
+    | Data classification | `internal` |
+    | PII fields | `account_number, member_name` |
+    | Producer service account IDs | `sa-cncb-producer` |
+    | Consumer service account IDs | `sa-cncb-consumer, sa-rtfd-enrichment` |
+
+    The issue number becomes your change tracking reference and is linked from your PR.
+  </Step>
+
+  <Step title="Add your Avro schema">
+    Place your `.avsc` file in `/schemas/{domain}-{entity}.avsc`. File names must use kebab-case and match the topic's `domain` and `entity` segments exactly.
+
+    ```
+    schemas/
+    └── cncb-account-transaction.avsc
+    ```
+
+    Follow the field naming, logical type, and PII annotation requirements in the [Schema governance guide](/governance/schema-guide) before submitting. CI will reject schemas that fail JSON parse or Avro record validation.
+  </Step>
+
+  <Step title="Add your Terraform module call">
+    Create or update a `.tf` file in `/environments/prod-east/`. Copy an existing module call as a starting point and fill in your values. The module assembles the full topic name from your four identity inputs using the `{domain}.{application}.{version}.{entity}` format.
+
+    ```hcl
+    module "your_topic" {
+      source         = "../../modules/topic"
+      domain         = "your-domain"
+      application    = "your-app"
+      schema_version = "v1"
+      entity         = "your-entity"
+      owner          = "your-team@fsi.org"
+      sla_tier       = "standard"
+      schema_file    = "../../schemas/your-domain-your-entity.avsc"
+      pii_fields     = []
+
+      producer_service_accounts = ["sa-your-producer"]
+      consumer_service_accounts = ["sa-your-consumer"]
+
+      # Infrastructure references — copy from an existing module call in this directory
+      kafka_cluster_id               = local.infra.kafka_cluster_id
+      kafka_rest_endpoint            = local.infra.kafka_rest_endpoint
+      kafka_api_key                  = local.infra.kafka_api_key
+      kafka_api_secret               = local.infra.kafka_api_secret
+      kafka_cluster_crn              = local.infra.kafka_cluster_crn
+      schema_registry_cluster_id     = local.infra.schema_registry_cluster_id
+      schema_registry_rest_endpoint  = local.infra.schema_registry_rest_endpoint
+      schema_registry_api_key        = local.infra.schema_registry_api_key
+      schema_registry_api_secret     = local.infra.schema_registry_api_secret
+      schema_registry_cluster_crn    = local.infra.schema_registry_cluster_crn
+      dr_kafka_cluster_id            = local.infra.dr_kafka_cluster_id
+      dr_kafka_rest_endpoint         = local.infra.dr_kafka_rest_endpoint
+      dr_kafka_api_key               = local.infra.dr_kafka_api_key
+      dr_kafka_api_secret            = local.infra.dr_kafka_api_secret
+    }
+    ```
+
+    A single module call produces the topic, registers the schema, applies RBAC bindings for producers and consumers, tags schema metadata, and creates the DR mirror topic on the West cluster.
+  </Step>
+
+  <Step title="Submit a pull request">
+    Open a PR against the `main` branch. The PR template auto-populates a review checklist that covers naming validation, schema compatibility, PII tagging, and SLA tier selection. The CI pipeline runs on every PR and performs:
+
+    - `terraform fmt -check` — formatting consistency
+    - `terraform validate` — HCL syntax validation
+    - Avro schema JSON parse and record structure validation (Python)
+    - `terraform plan` — plan output is posted as a PR comment
+
+    **C4E review SLA:** The Center of Enablement team targets a same-business-day review. Reviews may take longer when the topic uses `data_classification = confidential`, requires a compatibility override, or falls in the `compliance` SLA tier. Reference your intake issue number in the PR description to speed up triage.
+  </Step>
+
+  <Step title="Merge and verify">
+    After C4E approval, merge the PR. GitHub Actions runs `terraform apply` automatically for changes under `environments/`, `modules/`, or `schemas/`.
+
+    Verify the following after apply completes:
+
+    ```bash
+    # Topic exists on the production cluster
+    confluent kafka topic describe cncb.core.v1.account-transaction \
+      --cluster $KAFKA_CLUSTER_ID
+
+    # Schema is registered
+    confluent schema-registry subject describe cncb.core.v1.account-transaction-value \
+      --sr-cluster $SR_CLUSTER_ID
+
+    # Mirror topic exists on DR cluster
+    confluent kafka mirror describe cncb.core.v1.account-transaction \
+      --link cluster_link_bidir_east_west \
+      --cluster $DR_KAFKA_CLUSTER_ID
+
+    # RBAC bindings are applied
+    confluent iam rbac role-binding list \
+      --principal User:sa-cncb-producer \
+      --cluster-name $KAFKA_CLUSTER_ID
+    ```
+
+    If any of these checks fail, post in the `#kafka-cop` Teams channel with your PR link and apply run ID.
+  </Step>
+</Steps>
+
+## What the module provisions
+
+One `module` block in Terraform produces all of the following resources atomically. No additional configuration is required.
+
+| Resource | Description |
+|---|---|
+| `confluent_kafka_topic` | The topic on the East (production) cluster with partition count and retention derived from your SLA tier |
+| `confluent_schema` | Avro value schema registered in Schema Registry with ownership and PII metadata tags |
+| `confluent_subject_config` | Compatibility mode set on the schema subject (derived from SLA tier, or your `compatibility_override`) |
+| `confluent_role_binding` (producer) | `DeveloperWrite` on the topic for each producer service account |
+| `confluent_role_binding` (consumer) | `DeveloperRead` on the topic and consumer group for each consumer service account |
+| `confluent_role_binding` (SR) | `DeveloperRead` on the schema subject for all service accounts; `DeveloperWrite` for producers |
+| `confluent_kafka_mirror_topic` | Async mirror topic on the West (DR) cluster via the bidirectional cluster link |
+
+## Related guides
+
+- [Schema governance: naming, compatibility, and evolution](/governance/schema-guide) — naming rules, compatibility modes, PII tagging, and the breaking-change runbook
+- [SLA tiers: critical, standard, best-effort, compliance](/governance/sla-tiers) — how to choose a tier and what each tier configures automatically
+- [Security and RBAC](/governance/security-rbac) — service account declarations, mTLS, and CSFLE for confidential topics
